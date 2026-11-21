@@ -9,7 +9,11 @@ use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
+use rayon::prelude::*;
 use serde_json::Value;
+
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 const DAYS_IN_MONTH: [u32; 13] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 const DAYS_IN_MONTH_LEAP: [u32; 13] = [0, 31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
@@ -307,6 +311,20 @@ struct ValidClick {
     campaign_id: String,
 }
 
+struct UserDayAgg {
+    sessions: i64,
+    events: i64,
+    revenue_cents: i64,
+    cat_spend: HashMap<String, i64>,
+}
+
+struct CampDayAgg {
+    sessions: i64,
+    purchasing_sessions: i64,
+    revenue_cents: i64,
+    assisted_sessions: i64,
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let data_dir = std::env::var("DATA_DIR")
@@ -322,8 +340,8 @@ fn main() {
     let manifest: Value = serde_json::from_slice(&manifest_bytes).expect("Failed to parse manifest.json");
     let window_start_str = manifest["window_start"].as_str().expect("window_start missing");
     let window_end_str = manifest["window_end"].as_str().expect("window_end missing");
-    let window_start_ms = parse_iso_f1(window_start_str.as_bytes()).expect("invalid window_start");
-    let window_end_ms = parse_iso_f1(window_end_str.as_bytes()).expect("invalid window_end");
+    let window_start_ms = parse_timestamp(window_start_str.as_bytes()).expect("invalid window_start");
+    let window_end_ms = parse_timestamp(window_end_str.as_bytes()).expect("invalid window_end");
     let click_window_start_ms = window_start_ms - 7 * 86400 * 1000;
 
     // 2. Read products.csv
@@ -375,36 +393,58 @@ fn main() {
         }
     }
 
-    // 5. Ingest & Dedup Events
-    let mut raw_events_by_id: HashMap<String, (i64, RawEvent)> = HashMap::new();
-    for ef in list_csv_files(&data_path.join("events")) {
-        let content = fs::read(&ef).unwrap_or_default();
-        let mut lines = content.split(|&b| b == b'\n');
-        lines.next();
-        for line in lines {
-            if let Some(fields) = parse_csv_line(line, 7) {
-                if fields[0].is_empty() {
-                    continue;
-                }
-                let eid = String::from_utf8_lossy(fields[0]).to_string();
-                if let Some(ingest_ms) = parse_iso_f1(fields[3]) {
-                    let raw = RawEvent {
-                        user_id: String::from_utf8_lossy(fields[1]).to_string(),
-                        ts_bytes: fields[2].to_vec(),
-                        event_type: String::from_utf8_lossy(fields[4]).to_string(),
-                        prod_id: String::from_utf8_lossy(fields[5]).to_string(),
-                        price_bytes: fields[6].to_vec(),
-                    };
-                    match raw_events_by_id.get_mut(&eid) {
-                        Some(existing) => {
-                            if ingest_ms < existing.0 {
-                                *existing = (ingest_ms, raw);
+    // 5. Ingest & Dedup Events in Parallel with Rayon
+    let event_files = list_csv_files(&data_path.join("events"));
+    let partial_events: Vec<HashMap<String, (i64, RawEvent)>> = event_files
+        .par_iter()
+        .map(|ef| {
+            let mut map = HashMap::new();
+            if let Ok(content) = fs::read(ef) {
+                let mut lines = content.split(|&b| b == b'\n');
+                lines.next();
+                for line in lines {
+                    if let Some(fields) = parse_csv_line(line, 7) {
+                        if fields[0].is_empty() {
+                            continue;
+                        }
+                        let eid = String::from_utf8_lossy(fields[0]).to_string();
+                        if let Some(ingest_ms) = parse_iso_f1(fields[3]) {
+                            let raw = RawEvent {
+                                user_id: String::from_utf8_lossy(fields[1]).to_string(),
+                                ts_bytes: fields[2].to_vec(),
+                                event_type: String::from_utf8_lossy(fields[4]).to_string(),
+                                prod_id: String::from_utf8_lossy(fields[5]).to_string(),
+                                price_bytes: fields[6].to_vec(),
+                            };
+                            match map.get_mut(&eid) {
+                                Some(existing) => {
+                                    if ingest_ms < existing.0 {
+                                        *existing = (ingest_ms, raw);
+                                    }
+                                }
+                                None => {
+                                    map.insert(eid, (ingest_ms, raw));
+                                }
                             }
                         }
-                        None => {
-                            raw_events_by_id.insert(eid, (ingest_ms, raw));
-                        }
                     }
+                }
+            }
+            map
+        })
+        .collect();
+
+    let mut raw_events_by_id: HashMap<String, (i64, RawEvent)> = HashMap::new();
+    for part in partial_events {
+        for (eid, (ingest_ms, raw)) in part {
+            match raw_events_by_id.get_mut(&eid) {
+                Some(existing) => {
+                    if ingest_ms < existing.0 {
+                        *existing = (ingest_ms, raw);
+                    }
+                }
+                None => {
+                    raw_events_by_id.insert(eid, (ingest_ms, raw));
                 }
             }
         }
@@ -468,24 +508,37 @@ fn main() {
         });
     }
 
-    // 7. Ingest & Dedup Clicks
-    let mut raw_clicks_by_id: HashMap<String, (String, String, Vec<u8>)> = HashMap::new();
-    for cf in list_csv_files(&data_path.join("clicks")) {
-        let content = fs::read(&cf).unwrap_or_default();
-        let mut lines = content.split(|&b| b == b'\n');
-        lines.next();
-        for line in lines {
-            if let Some(fields) = parse_csv_line(line, 4) {
-                if fields[0].is_empty() {
-                    continue;
-                }
-                let cid = String::from_utf8_lossy(fields[0]).to_string();
-                if !raw_clicks_by_id.contains_key(&cid) {
-                    let uid = String::from_utf8_lossy(fields[1]).to_string();
-                    let camp = String::from_utf8_lossy(fields[2]).to_string();
-                    raw_clicks_by_id.insert(cid, (uid, camp, fields[3].to_vec()));
+    // 7. Ingest & Dedup Clicks in Parallel with Rayon
+    let click_files = list_csv_files(&data_path.join("clicks"));
+    let partial_clicks: Vec<HashMap<String, (String, String, Vec<u8>)>> = click_files
+        .par_iter()
+        .map(|cf| {
+            let mut map = HashMap::new();
+            if let Ok(content) = fs::read(cf) {
+                let mut lines = content.split(|&b| b == b'\n');
+                lines.next();
+                for line in lines {
+                    if let Some(fields) = parse_csv_line(line, 4) {
+                        if fields[0].is_empty() {
+                            continue;
+                        }
+                        let cid = String::from_utf8_lossy(fields[0]).to_string();
+                        if !map.contains_key(&cid) {
+                            let uid = String::from_utf8_lossy(fields[1]).to_string();
+                            let camp = String::from_utf8_lossy(fields[2]).to_string();
+                            map.insert(cid, (uid, camp, fields[3].to_vec()));
+                        }
+                    }
                 }
             }
+            map
+        })
+        .collect();
+
+    let mut raw_clicks_by_id: HashMap<String, (String, String, Vec<u8>)> = HashMap::new();
+    for part in partial_clicks {
+        for (cid, val) in part {
+            raw_clicks_by_id.entry(cid).or_insert(val);
         }
     }
 
@@ -518,137 +571,137 @@ fn main() {
         clicks.sort_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.click_id.cmp(&b.click_id)));
     }
 
-    // 9. Sessionize Events
+    // 9. Sessionize Events & Aggregate in Parallel with Rayon
     let mut events_by_person: HashMap<String, Vec<ValidEvent>> = HashMap::new();
     for ev in valid_events {
         events_by_person.entry(ev.person_id.clone()).or_default().push(ev);
     }
 
-    struct UserDayAgg {
-        sessions: i64,
-        events: i64,
-        revenue_cents: i64,
-        cat_spend: HashMap<String, i64>,
-    }
+    let session_results: Vec<(
+        Vec<((String, i32), (i64, i64, i64, HashMap<String, i64>))>,
+        Vec<((String, i32), (i64, i64, i64, i64))>,
+    )> = events_by_person
+        .into_par_iter()
+        .map(|(person_id, mut ev_list)| {
+            ev_list.sort_unstable_by_key(|e| e.ts);
 
-    struct CampDayAgg {
-        sessions: i64,
-        purchasing_sessions: i64,
-        revenue_cents: i64,
-        assisted_sessions: i64,
-    }
+            let mut sessions: Vec<Vec<ValidEvent>> = Vec::new();
+            let mut curr_sess: Vec<ValidEvent> = Vec::new();
+            let mut last_distinct_ts: Option<i64> = None;
+
+            for ev in ev_list {
+                let ts = ev.ts;
+                if curr_sess.is_empty() {
+                    curr_sess.push(ev);
+                    last_distinct_ts = Some(ts);
+                } else if Some(ts) == last_distinct_ts {
+                    curr_sess.push(ev);
+                } else if ts - last_distinct_ts.unwrap() > 1_800_000 {
+                    sessions.push(std::mem::take(&mut curr_sess));
+                    curr_sess.push(ev);
+                    last_distinct_ts = Some(ts);
+                } else {
+                    curr_sess.push(ev);
+                    last_distinct_ts = Some(ts);
+                }
+            }
+            if !curr_sess.is_empty() {
+                sessions.push(curr_sess);
+            }
+
+            let p_clicks = clicks_by_person.get(&person_id);
+            let mut local_user_daily = Vec::new();
+            let mut local_camp_events = Vec::new();
+
+            for sess in sessions {
+                let sess_start_ms = sess[0].ts;
+                let sess_day = (sess_start_ms / 86_400_000) as i32;
+
+                let sess_events_count = sess.len() as i64;
+                let mut sess_revenue = 0i64;
+                let mut sess_purchases = 0i64;
+                let mut sess_cat_spend: HashMap<String, i64> = HashMap::new();
+
+                for ev in &sess {
+                    if ev.event_type == "purchase" {
+                        sess_revenue += ev.price_cents;
+                        sess_purchases += 1;
+                        *sess_cat_spend.entry(ev.category.clone()).or_default() += ev.price_cents;
+                    }
+                }
+
+                local_user_daily.push((
+                    (person_id.clone(), sess_day),
+                    (1i64, sess_events_count, sess_revenue, sess_cat_spend),
+                ));
+
+                // Attribution
+                let min_click_ts = sess_start_ms - 604_800_000;
+                let mut eligible_clicks: Vec<&ValidClick> = Vec::new();
+                if let Some(clicks) = p_clicks {
+                    for c in clicks {
+                        if c.ts >= min_click_ts && c.ts <= sess_start_ms {
+                            eligible_clicks.push(c);
+                        }
+                    }
+                }
+
+                let mut credited_camp = "organic".to_string();
+                if !eligible_clicks.is_empty() {
+                    let best = eligible_clicks
+                        .iter()
+                        .min_by(|a, b| b.ts.cmp(&a.ts).then_with(|| a.click_id.cmp(&b.click_id)))
+                        .unwrap();
+                    credited_camp = best.campaign_id.clone();
+                }
+
+                let mut assisting_camps: HashSet<String> = HashSet::new();
+                for c in eligible_clicks {
+                    assisting_camps.insert(c.campaign_id.clone());
+                }
+
+                let purch = if sess_purchases > 0 { 1i64 } else { 0i64 };
+                local_camp_events.push(((credited_camp, sess_day), (1i64, purch, sess_revenue, 0i64)));
+
+                for acamp in assisting_camps {
+                    local_camp_events.push(((acamp, sess_day), (0i64, 0i64, 0i64, 1i64)));
+                }
+            }
+
+            (local_user_daily, local_camp_events)
+        })
+        .collect();
 
     let mut user_daily_map: HashMap<(String, i32), UserDayAgg> = HashMap::new();
     let mut campaign_daily_map: HashMap<(String, i32), CampDayAgg> = HashMap::new();
 
-    for (person_id, mut ev_list) in events_by_person {
-        ev_list.sort_by_key(|e| e.ts);
-
-        let mut sessions: Vec<Vec<ValidEvent>> = Vec::new();
-        let mut curr_sess: Vec<ValidEvent> = Vec::new();
-        let mut last_distinct_ts: Option<i64> = None;
-
-        for ev in ev_list {
-            let ts = ev.ts;
-            if curr_sess.is_empty() {
-                curr_sess.push(ev);
-                last_distinct_ts = Some(ts);
-            } else if Some(ts) == last_distinct_ts {
-                curr_sess.push(ev);
-            } else if ts - last_distinct_ts.unwrap() > 1_800_000 {
-                sessions.push(std::mem::take(&mut curr_sess));
-                curr_sess.push(ev);
-                last_distinct_ts = Some(ts);
-            } else {
-                curr_sess.push(ev);
-                last_distinct_ts = Some(ts);
-            }
-        }
-        if !curr_sess.is_empty() {
-            sessions.push(curr_sess);
-        }
-
-        let p_clicks = clicks_by_person.get(&person_id);
-
-        for sess in sessions {
-            let sess_start_ms = sess[0].ts;
-            let sess_day = (sess_start_ms / 86_400_000) as i32;
-
-            let sess_events_count = sess.len() as i64;
-            let mut sess_revenue = 0i64;
-            let mut sess_purchases = 0i64;
-            let mut sess_cat_spend: HashMap<String, i64> = HashMap::new();
-
-            for ev in &sess {
-                if ev.event_type == "purchase" {
-                    sess_revenue += ev.price_cents;
-                    sess_purchases += 1;
-                    *sess_cat_spend.entry(ev.category.clone()).or_default() += ev.price_cents;
-                }
-            }
-
-            let ukey = (person_id.clone(), sess_day);
+    for (user_records, camp_records) in session_results {
+        for (ukey, (sess_cnt, ev_cnt, rev, cat_sp)) in user_records {
             let uentry = user_daily_map.entry(ukey).or_insert_with(|| UserDayAgg {
                 sessions: 0,
                 events: 0,
                 revenue_cents: 0,
                 cat_spend: HashMap::new(),
             });
-            uentry.sessions += 1;
-            uentry.events += sess_events_count;
-            uentry.revenue_cents += sess_revenue;
-            for (cat, sp) in sess_cat_spend {
+            uentry.sessions += sess_cnt;
+            uentry.events += ev_cnt;
+            uentry.revenue_cents += rev;
+            for (cat, sp) in cat_sp {
                 *uentry.cat_spend.entry(cat).or_default() += sp;
             }
+        }
 
-            // Attribution
-            let min_click_ts = sess_start_ms - 604_800_000;
-            let mut eligible_clicks: Vec<&ValidClick> = Vec::new();
-            if let Some(clicks) = p_clicks {
-                for c in clicks {
-                    if c.ts >= min_click_ts && c.ts <= sess_start_ms {
-                        eligible_clicks.push(c);
-                    }
-                }
-            }
-
-            let mut credited_camp = "organic".to_string();
-            if !eligible_clicks.is_empty() {
-                let best = eligible_clicks
-                    .iter()
-                    .min_by(|a, b| b.ts.cmp(&a.ts).then_with(|| a.click_id.cmp(&b.click_id)))
-                    .unwrap();
-                credited_camp = best.campaign_id.clone();
-            }
-
-            let mut assisting_camps: HashSet<String> = HashSet::new();
-            for c in eligible_clicks {
-                assisting_camps.insert(c.campaign_id.clone());
-            }
-
-            let ckey = (credited_camp, sess_day);
+        for (ckey, (sess_cnt, purch_cnt, rev, assist_cnt)) in camp_records {
             let centry = campaign_daily_map.entry(ckey).or_insert_with(|| CampDayAgg {
                 sessions: 0,
                 purchasing_sessions: 0,
                 revenue_cents: 0,
                 assisted_sessions: 0,
             });
-            centry.sessions += 1;
-            if sess_purchases > 0 {
-                centry.purchasing_sessions += 1;
-            }
-            centry.revenue_cents += sess_revenue;
-
-            for acamp in assisting_camps {
-                let akey = (acamp, sess_day);
-                let aentry = campaign_daily_map.entry(akey).or_insert_with(|| CampDayAgg {
-                    sessions: 0,
-                    purchasing_sessions: 0,
-                    revenue_cents: 0,
-                    assisted_sessions: 0,
-                });
-                aentry.assisted_sessions += 1;
-            }
+            centry.sessions += sess_cnt;
+            centry.purchasing_sessions += purch_cnt;
+            centry.revenue_cents += rev;
+            centry.assisted_sessions += assist_cnt;
         }
     }
 

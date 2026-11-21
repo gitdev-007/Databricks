@@ -5,14 +5,14 @@ edition = "2021"
 
 [dependencies]
 rayon = "1.10"
-memmap2 = "0.9"
-hashbrown = { version = "0.15", features = ["rayon", "raw-entry"] }
+hashbrown = "0.15"
 ahash = "0.8"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 memchr = "2.7"
 arrow = "54.2"
 parquet = { version = "54.2", default-features = false, features = ["arrow", "snap"] }
+mimalloc = { version = "0.1", default-features = false }
 
 [profile.release]
 opt-level = 3
