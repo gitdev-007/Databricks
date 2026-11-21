@@ -12,8 +12,6 @@ use parquet::file::properties::WriterProperties;
 use rayon::prelude::*;
 use serde_json::Value;
 
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 const DAYS_IN_MONTH: [u32; 13] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 const DAYS_IN_MONTH_LEAP: [u32; 13] = [0, 31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
@@ -398,7 +396,7 @@ fn main() {
     let partial_events: Vec<HashMap<String, (i64, RawEvent)>> = event_files
         .par_iter()
         .map(|ef| {
-            let mut map = HashMap::new();
+            let mut map: HashMap<String, (i64, RawEvent)> = HashMap::new();
             if let Ok(content) = fs::read(ef) {
                 let mut lines = content.split(|&b| b == b'\n');
                 lines.next();
@@ -513,7 +511,7 @@ fn main() {
     let partial_clicks: Vec<HashMap<String, (String, String, Vec<u8>)>> = click_files
         .par_iter()
         .map(|cf| {
-            let mut map = HashMap::new();
+            let mut map: HashMap<String, (String, String, Vec<u8>)> = HashMap::new();
             if let Ok(content) = fs::read(cf) {
                 let mut lines = content.split(|&b| b == b'\n');
                 lines.next();

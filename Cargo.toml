@@ -12,12 +12,11 @@ serde_json = "1.0"
 memchr = "2.7"
 arrow = "54.2"
 parquet = { version = "54.2", default-features = false, features = ["arrow", "snap"] }
-mimalloc = { version = "0.1", default-features = false }
 
 [profile.release]
 opt-level = 3
-lto = "fat"
-codegen-units = 1
+lto = "thin"
+codegen-units = 16
 panic = "abort"
 overflow-checks = false
 strip = true
