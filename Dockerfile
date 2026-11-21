@@ -1,7 +1,7 @@
 # Stage 1: Build native high-performance binary
 FROM rust:1.85-bookworm AS builder
 WORKDIR /app
-COPY Cargo.toml ./
+COPY Cargo.toml Cargo.lock* ./
 COPY src/ ./src/
 RUN cargo build --release
 

@@ -1,4 +1,3 @@
-use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -6,12 +5,13 @@ use std::sync::Arc;
 use arrow::array::{Date32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use hashbrown::{HashMap, HashSet};
+use memmap2::Mmap;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use rayon::prelude::*;
 use serde_json::Value;
-
 
 const DAYS_IN_MONTH: [u32; 13] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 const DAYS_IN_MONTH_LEAP: [u32; 13] = [0, 31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
@@ -52,6 +52,7 @@ fn parse_csv_line<'a>(mut line: &'a [u8], expected_fields: usize) -> Option<Vec<
     }
 }
 
+#[inline(always)]
 fn parse_iso_f1(s: &[u8]) -> Option<i64> {
     if s.len() != 20 || s[10] != b'T' || s[19] != b'Z' {
         return None;
@@ -102,6 +103,7 @@ fn parse_iso_f1(s: &[u8]) -> Option<i64> {
     Some(sec * 1000)
 }
 
+#[inline(always)]
 fn parse_iso_f2(s: &[u8]) -> Option<i64> {
     if s.len() != 25 || s[10] != b'T' || (s[19] != b'+' && s[19] != b'-') || s[22] != b':' {
         return None;
@@ -164,6 +166,7 @@ fn parse_iso_f2(s: &[u8]) -> Option<i64> {
     })
 }
 
+#[inline(always)]
 fn parse_f3(s: &[u8]) -> Option<i64> {
     if s.is_empty() {
         return None;
@@ -183,6 +186,7 @@ fn parse_f3(s: &[u8]) -> Option<i64> {
     Some(val)
 }
 
+#[inline(always)]
 fn parse_timestamp(s: &[u8]) -> Option<i64> {
     if s.is_empty() {
         None
@@ -197,9 +201,10 @@ fn parse_timestamp(s: &[u8]) -> Option<i64> {
     }
 }
 
+#[derive(Clone)]
 struct Dsu {
     names: Vec<String>,
-    name_to_id: HashMap<String, u32>,
+    name_to_id: HashMap<String, u32, ahash::RandomState>,
     parent: Vec<u32>,
     canonical: Vec<u32>,
 }
@@ -208,7 +213,7 @@ impl Dsu {
     fn new() -> Self {
         Self {
             names: Vec::new(),
-            name_to_id: HashMap::new(),
+            name_to_id: HashMap::default(),
             parent: Vec::new(),
             canonical: Vec::new(),
         }
@@ -285,15 +290,6 @@ fn list_csv_files(dir: &Path) -> Vec<PathBuf> {
 }
 
 #[derive(Clone)]
-struct RawEvent {
-    user_id: String,
-    ts_bytes: Vec<u8>,
-    event_type: String,
-    prod_id: String,
-    price_bytes: Vec<u8>,
-}
-
-#[derive(Clone)]
 struct ValidEvent {
     person_id: String,
     ts: i64,
@@ -304,6 +300,7 @@ struct ValidEvent {
 
 #[derive(Clone)]
 struct ValidClick {
+    user_id: String,
     ts: i64,
     click_id: String,
     campaign_id: String,
@@ -313,7 +310,7 @@ struct UserDayAgg {
     sessions: i64,
     events: i64,
     revenue_cents: i64,
-    cat_spend: HashMap<String, i64>,
+    cat_spend: HashMap<String, i64, ahash::RandomState>,
 }
 
 struct CampDayAgg {
@@ -321,6 +318,19 @@ struct CampDayAgg {
     purchasing_sessions: i64,
     revenue_cents: i64,
     assisted_sessions: i64,
+}
+
+const NUM_SHARDS: usize = 256;
+
+#[derive(Copy, Clone)]
+struct RawEventRef<'a> {
+    line: &'a [u8],
+    ingest_ms: i64,
+}
+
+#[derive(Copy, Clone)]
+struct RawClickRef<'a> {
+    line: &'a [u8],
 }
 
 fn main() {
@@ -343,33 +353,35 @@ fn main() {
     let click_window_start_ms = window_start_ms - 7 * 86400 * 1000;
 
     // 2. Read products.csv
-    let mut products = HashMap::new();
+    let mut products: HashMap<String, String, ahash::RandomState> = HashMap::default();
     let prod_file = data_path.join("products.csv");
     if prod_file.exists() {
-        let content = fs::read(&prod_file).unwrap_or_default();
-        let mut lines = content.split(|&b| b == b'\n');
-        lines.next();
-        for line in lines {
-            if let Some(fields) = parse_csv_line(line, 2) {
-                let pid = String::from_utf8_lossy(fields[0]).to_string();
-                let cat = String::from_utf8_lossy(fields[1]).to_string();
-                products.insert(pid, cat);
+        if let Ok(content) = fs::read(&prod_file) {
+            let mut lines = content.split(|&b| b == b'\n');
+            lines.next();
+            for line in lines {
+                if let Some(fields) = parse_csv_line(line, 2) {
+                    let pid = String::from_utf8_lossy(fields[0]).to_string();
+                    let cat = String::from_utf8_lossy(fields[1]).to_string();
+                    products.insert(pid, cat);
+                }
             }
         }
     }
 
     // 3. Read campaigns.csv
-    let mut campaigns = HashMap::new();
+    let mut campaigns: HashMap<String, String, ahash::RandomState> = HashMap::default();
     let camp_file = data_path.join("campaigns.csv");
     if camp_file.exists() {
-        let content = fs::read(&camp_file).unwrap_or_default();
-        let mut lines = content.split(|&b| b == b'\n');
-        lines.next();
-        for line in lines {
-            if let Some(fields) = parse_csv_line(line, 2) {
-                let cid = String::from_utf8_lossy(fields[0]).to_string();
-                let channel = String::from_utf8_lossy(fields[1]).to_string();
-                campaigns.insert(cid, channel);
+        if let Ok(content) = fs::read(&camp_file) {
+            let mut lines = content.split(|&b| b == b'\n');
+            lines.next();
+            for line in lines {
+                if let Some(fields) = parse_csv_line(line, 2) {
+                    let cid = String::from_utf8_lossy(fields[0]).to_string();
+                    let channel = String::from_utf8_lossy(fields[1]).to_string();
+                    campaigns.insert(cid, channel);
+                }
             }
         }
     }
@@ -377,292 +389,411 @@ fn main() {
     // 4. Read links/*.csv into DSU
     let mut dsu = Dsu::new();
     for lf in list_csv_files(&data_path.join("links")) {
-        let content = fs::read(&lf).unwrap_or_default();
-        let mut lines = content.split(|&b| b == b'\n');
-        lines.next();
-        for line in lines {
-            if let Some(fields) = parse_csv_line(line, 2) {
-                if !fields[0].is_empty() && !fields[1].is_empty() {
-                    let a = String::from_utf8_lossy(fields[0]);
-                    let b = String::from_utf8_lossy(fields[1]);
-                    dsu.union(&a, &b);
+        if let Ok(content) = fs::read(&lf) {
+            let mut lines = content.split(|&b| b == b'\n');
+            lines.next();
+            for line in lines {
+                if let Some(fields) = parse_csv_line(line, 2) {
+                    if !fields[0].is_empty() && !fields[1].is_empty() {
+                        let a = String::from_utf8_lossy(fields[0]);
+                        let b = String::from_utf8_lossy(fields[1]);
+                        dsu.union(&a, &b);
+                    }
                 }
             }
         }
     }
 
-    // 5. Ingest & Dedup Events in Parallel with Rayon
+    let ahash_builder = ahash::RandomState::with_seeds(11, 22, 33, 44);
+
+    // 5. Ingest & Dedup Events with Sharding & Parallelism
     let event_files = list_csv_files(&data_path.join("events"));
-    let partial_events: Vec<HashMap<String, (i64, RawEvent)>> = event_files
+    let event_mmaps: Vec<Mmap> = event_files
+        .iter()
+        .filter_map(|ef| {
+            let f = File::open(ef).ok()?;
+            unsafe { Mmap::map(&f).ok() }
+        })
+        .collect();
+
+    let per_file_shards: Vec<Vec<Vec<RawEventRef>>> = event_mmaps
         .par_iter()
-        .map(|ef| {
-            let mut map: HashMap<String, (i64, RawEvent)> = HashMap::new();
-            if let Ok(content) = fs::read(ef) {
-                let mut lines = content.split(|&b| b == b'\n');
-                lines.next();
-                for line in lines {
-                    if let Some(fields) = parse_csv_line(line, 7) {
-                        if fields[0].is_empty() {
-                            continue;
+        .map(|mmap| {
+            let mut shards: Vec<Vec<RawEventRef>> = (0..NUM_SHARDS).map(|_| Vec::new()).collect();
+            let mut start = 0;
+            if let Some(first_nl) = memchr::memchr(b'\n', mmap) {
+                start = first_nl + 1;
+            }
+            let bytes = &mmap[start..];
+            for line in bytes.split(|&b| b == b'\n') {
+                if line.is_empty() {
+                    continue;
+                }
+                let mut comma_count = 0;
+                let mut f0_end = 0;
+                let mut f3_start = 0;
+                let mut f3_end = 0;
+                for (idx, &b) in line.iter().enumerate() {
+                    if b == b',' {
+                        comma_count += 1;
+                        if comma_count == 1 {
+                            f0_end = idx;
+                        } else if comma_count == 3 {
+                            f3_start = idx + 1;
+                        } else if comma_count == 4 {
+                            f3_end = idx;
+                            break;
                         }
-                        let eid = String::from_utf8_lossy(fields[0]).to_string();
-                        if let Some(ingest_ms) = parse_iso_f1(fields[3]) {
-                            let raw = RawEvent {
-                                user_id: String::from_utf8_lossy(fields[1]).to_string(),
-                                ts_bytes: fields[2].to_vec(),
-                                event_type: String::from_utf8_lossy(fields[4]).to_string(),
-                                prod_id: String::from_utf8_lossy(fields[5]).to_string(),
-                                price_bytes: fields[6].to_vec(),
-                            };
-                            match map.get_mut(&eid) {
-                                Some(existing) => {
-                                    if ingest_ms < existing.0 {
-                                        *existing = (ingest_ms, raw);
-                                    }
-                                }
-                                None => {
-                                    map.insert(eid, (ingest_ms, raw));
-                                }
+                    }
+                }
+                if comma_count >= 4 && f0_end > 0 && f3_end > f3_start {
+                    let mut eid = &line[..f0_end];
+                    if eid.starts_with(b"\"") && eid.ends_with(b"\"") && eid.len() >= 2 {
+                        eid = &eid[1..eid.len() - 1];
+                    }
+                    if !eid.is_empty() {
+                        let mut ingest_bytes = &line[f3_start..f3_end];
+                        if ingest_bytes.starts_with(b"\"") && ingest_bytes.ends_with(b"\"") && ingest_bytes.len() >= 2 {
+                            ingest_bytes = &ingest_bytes[1..ingest_bytes.len() - 1];
+                        }
+                        if let Some(ingest_ms) = parse_iso_f1(ingest_bytes) {
+                            let h = ahash_builder.hash_one(eid);
+                            let shard_idx = (h as usize) % NUM_SHARDS;
+                            shards[shard_idx].push(RawEventRef { line, ingest_ms });
+                        }
+                    }
+                }
+            }
+            shards
+        })
+        .collect();
+
+    let mut combined_event_shards: Vec<Vec<RawEventRef>> = (0..NUM_SHARDS).map(|_| Vec::new()).collect();
+    for file_shards in per_file_shards {
+        for (s_idx, s_vec) in file_shards.into_iter().enumerate() {
+            combined_event_shards[s_idx].extend(s_vec);
+        }
+    }
+
+    let dsu_arc = Arc::new(dsu);
+    let prod_arc = Arc::new(products);
+
+    let valid_event_shards: Vec<Vec<ValidEvent>> = combined_event_shards
+        .into_par_iter()
+        .map(|shard| {
+            let mut dedup_map: HashMap<&[u8], RawEventRef, ahash::RandomState> = HashMap::default();
+            for r in shard {
+                if let Some(fields) = parse_csv_line(r.line, 7) {
+                    if fields[0].is_empty() {
+                        continue;
+                    }
+                    let eid = fields[0];
+                    match dedup_map.entry(eid) {
+                        hashbrown::hash_map::Entry::Occupied(mut occ) => {
+                            if r.ingest_ms < occ.get().ingest_ms {
+                                occ.insert(r);
                             }
                         }
+                        hashbrown::hash_map::Entry::Vacant(vac) => {
+                            vac.insert(r);
+                        }
                     }
                 }
             }
-            map
-        })
-        .collect();
 
-    let mut raw_events_by_id: HashMap<String, (i64, RawEvent)> = HashMap::new();
-    for part in partial_events {
-        for (eid, (ingest_ms, raw)) in part {
-            match raw_events_by_id.get_mut(&eid) {
-                Some(existing) => {
-                    if ingest_ms < existing.0 {
-                        *existing = (ingest_ms, raw);
+            let mut out = Vec::with_capacity(dedup_map.len());
+            for (_eid, r) in dedup_map {
+                if let Some(fields) = parse_csv_line(r.line, 7) {
+                    let uid = fields[1];
+                    if uid.is_empty() {
+                        continue;
                     }
-                }
-                None => {
-                    raw_events_by_id.insert(eid, (ingest_ms, raw));
-                }
-            }
-        }
-    }
+                    let ts_ms = match parse_timestamp(fields[2]) {
+                        Some(t) if t >= window_start_ms && t < window_end_ms => t,
+                        _ => continue,
+                    };
+                    let etype = fields[4];
+                    if etype != b"view" && etype != b"cart" && etype != b"purchase" {
+                        continue;
+                    }
+                    let pid = fields[5];
+                    if pid.is_empty() {
+                        continue;
+                    }
 
-    // 6. Validate Kept Event Copies
-    let mut valid_events: Vec<ValidEvent> = Vec::with_capacity(raw_events_by_id.len());
-    for (_eid, (ingest_ms, raw)) in raw_events_by_id {
-        if raw.user_id.is_empty() {
-            continue;
-        }
-        let ts_ms = match parse_timestamp(&raw.ts_bytes) {
-            Some(t) if t >= window_start_ms && t < window_end_ms => t,
-            _ => continue,
-        };
-        if raw.event_type != "view" && raw.event_type != "cart" && raw.event_type != "purchase" {
-            continue;
-        }
-        if raw.prod_id.is_empty() {
-            continue;
-        }
-
-        let mut price_cents = 0;
-        if raw.event_type == "purchase" {
-            if raw.price_bytes.is_empty() {
-                continue;
-            }
-            let mut is_digits = true;
-            for &b in &raw.price_bytes {
-                if !b.is_ascii_digit() {
-                    is_digits = false;
-                    break;
-                }
-            }
-            if !is_digits {
-                continue;
-            }
-            let mut p: i64 = 0;
-            for &b in &raw.price_bytes {
-                p = p.saturating_mul(10).saturating_add((b - b'0') as i64);
-            }
-            if p < 1 || p > 10_000_000 {
-                continue;
-            }
-            price_cents = p;
-        }
-
-        if ingest_ms - ts_ms > 86_400_000 {
-            continue;
-        }
-
-        let person_id = dsu.get_canonical(&raw.user_id);
-        let category = products.get(&raw.prod_id).cloned().unwrap_or_else(|| "unknown".into());
-
-        valid_events.push(ValidEvent {
-            person_id,
-            ts: ts_ms,
-            event_type: raw.event_type,
-            price_cents,
-            category,
-        });
-    }
-
-    // 7. Ingest & Dedup Clicks in Parallel with Rayon
-    let click_files = list_csv_files(&data_path.join("clicks"));
-    let partial_clicks: Vec<HashMap<String, (String, String, Vec<u8>)>> = click_files
-        .par_iter()
-        .map(|cf| {
-            let mut map: HashMap<String, (String, String, Vec<u8>)> = HashMap::new();
-            if let Ok(content) = fs::read(cf) {
-                let mut lines = content.split(|&b| b == b'\n');
-                lines.next();
-                for line in lines {
-                    if let Some(fields) = parse_csv_line(line, 4) {
-                        if fields[0].is_empty() {
+                    let mut price_cents = 0i64;
+                    if etype == b"purchase" {
+                        let p_bytes = fields[6];
+                        if p_bytes.is_empty() {
                             continue;
                         }
-                        let cid = String::from_utf8_lossy(fields[0]).to_string();
-                        if !map.contains_key(&cid) {
-                            let uid = String::from_utf8_lossy(fields[1]).to_string();
-                            let camp = String::from_utf8_lossy(fields[2]).to_string();
-                            map.insert(cid, (uid, camp, fields[3].to_vec()));
+                        let mut is_digits = true;
+                        for &b in p_bytes {
+                            if !b.is_ascii_digit() {
+                                is_digits = false;
+                                break;
+                            }
                         }
+                        if !is_digits {
+                            continue;
+                        }
+                        let mut p = 0i64;
+                        for &b in p_bytes {
+                            p = p.saturating_mul(10).saturating_add((b - b'0') as i64);
+                        }
+                        if p < 1 || p > 10_000_000 {
+                            continue;
+                        }
+                        price_cents = p;
                     }
+
+                    if r.ingest_ms - ts_ms > 86_400_000 {
+                        continue;
+                    }
+
+                    let u_str = String::from_utf8_lossy(uid);
+                    // DSU lookup
+                    let person_id = {
+                        let mut dsu_clone = (*dsu_arc).clone();
+                        dsu_clone.get_canonical(&u_str)
+                    };
+                    let p_str = String::from_utf8_lossy(pid);
+                    let category = prod_arc.get(p_str.as_ref()).cloned().unwrap_or_else(|| "unknown".into());
+
+                    out.push(ValidEvent {
+                        person_id,
+                        ts: ts_ms,
+                        event_type: String::from_utf8_lossy(etype).to_string(),
+                        price_cents,
+                        category,
+                    });
                 }
             }
-            map
+            out
         })
         .collect();
 
-    let mut raw_clicks_by_id: HashMap<String, (String, String, Vec<u8>)> = HashMap::new();
-    for part in partial_clicks {
-        for (cid, val) in part {
-            raw_clicks_by_id.entry(cid).or_insert(val);
+    // 6. Ingest & Dedup Clicks with Sharding & Parallelism
+    let click_files = list_csv_files(&data_path.join("clicks"));
+    let click_mmaps: Vec<Mmap> = click_files
+        .iter()
+        .filter_map(|cf| {
+            let f = File::open(cf).ok()?;
+            unsafe { Mmap::map(&f).ok() }
+        })
+        .collect();
+
+    let per_file_click_shards: Vec<Vec<Vec<RawClickRef>>> = click_mmaps
+        .par_iter()
+        .map(|mmap| {
+            let mut shards: Vec<Vec<RawClickRef>> = (0..NUM_SHARDS).map(|_| Vec::new()).collect();
+            let mut start = 0;
+            if let Some(first_nl) = memchr::memchr(b'\n', mmap) {
+                start = first_nl + 1;
+            }
+            let bytes = &mmap[start..];
+            for line in bytes.split(|&b| b == b'\n') {
+                if line.is_empty() {
+                    continue;
+                }
+                let mut comma_pos = 0;
+                for (idx, &b) in line.iter().enumerate() {
+                    if b == b',' {
+                        comma_pos = idx;
+                        break;
+                    }
+                }
+                if comma_pos > 0 {
+                    let mut cid = &line[..comma_pos];
+                    if cid.starts_with(b"\"") && cid.ends_with(b"\"") && cid.len() >= 2 {
+                        cid = &cid[1..cid.len() - 1];
+                    }
+                    if !cid.is_empty() {
+                        let h = ahash_builder.hash_one(cid);
+                        let shard_idx = (h as usize) % NUM_SHARDS;
+                        shards[shard_idx].push(RawClickRef { line });
+                    }
+                }
+            }
+            shards
+        })
+        .collect();
+
+    let mut combined_click_shards: Vec<Vec<RawClickRef>> = (0..NUM_SHARDS).map(|_| Vec::new()).collect();
+    for file_shards in per_file_click_shards {
+        for (s_idx, s_vec) in file_shards.into_iter().enumerate() {
+            combined_click_shards[s_idx].extend(s_vec);
         }
     }
 
-    // 8. Validate Clicks & Group by Person
-    let mut clicks_by_person: HashMap<String, Vec<ValidClick>> = HashMap::new();
-    for (cid, (uid, camp, ts_bytes)) in raw_clicks_by_id {
-        if uid.is_empty() {
-            continue;
-        }
-        let ts_ms = match parse_timestamp(&ts_bytes) {
-            Some(t) if t >= click_window_start_ms && t < window_end_ms => t,
-            _ => continue,
-        };
-        if !campaigns.contains_key(&camp) {
-            continue;
-        }
+    let camp_arc = Arc::new(campaigns);
 
-        let person_id = dsu.get_canonical(&uid);
-        clicks_by_person
-            .entry(person_id)
-            .or_default()
-            .push(ValidClick {
-                ts: ts_ms,
-                click_id: cid,
-                campaign_id: camp,
-            });
+    let valid_click_shards: Vec<Vec<ValidClick>> = combined_click_shards
+        .into_par_iter()
+        .map(|shard| {
+            let mut dedup_map: HashMap<&[u8], RawClickRef, ahash::RandomState> = HashMap::default();
+            for r in shard {
+                if let Some(fields) = parse_csv_line(r.line, 4) {
+                    if fields[0].is_empty() {
+                        continue;
+                    }
+                    let cid = fields[0];
+                    dedup_map.entry(cid).or_insert(r);
+                }
+            }
+
+            let mut out = Vec::with_capacity(dedup_map.len());
+            for (cid, r) in dedup_map {
+                if let Some(fields) = parse_csv_line(r.line, 4) {
+                    let uid = fields[1];
+                    let camp = fields[2];
+                    let ts_bytes = fields[3];
+                    if uid.is_empty() {
+                        continue;
+                    }
+                    let ts_ms = match parse_timestamp(ts_bytes) {
+                        Some(t) if t >= click_window_start_ms && t < window_end_ms => t,
+                        _ => continue,
+                    };
+                    let camp_str = String::from_utf8_lossy(camp);
+                    if !camp_arc.contains_key(camp_str.as_ref()) {
+                        continue;
+                    }
+
+                    out.push(ValidClick {
+                        user_id: String::from_utf8_lossy(uid).to_string(),
+                        ts: ts_ms,
+                        click_id: String::from_utf8_lossy(cid).to_string(),
+                        campaign_id: camp_str.to_string(),
+                    });
+                }
+            }
+            out
+        })
+        .collect();
+
+    // Group valid clicks by canonical person_id
+    let mut dsu_mut = (*dsu_arc).clone();
+    let mut clicks_by_person: HashMap<String, Vec<ValidClick>, ahash::RandomState> = HashMap::default();
+    for shard in valid_click_shards {
+        for c in shard {
+            let person_id = dsu_mut.get_canonical(&c.user_id);
+            clicks_by_person.entry(person_id).or_default().push(c);
+        }
     }
 
     for clicks in clicks_by_person.values_mut() {
         clicks.sort_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.click_id.cmp(&b.click_id)));
     }
 
-    // 9. Sessionize Events & Aggregate in Parallel with Rayon
-    let mut events_by_person: HashMap<String, Vec<ValidEvent>> = HashMap::new();
-    for ev in valid_events {
-        events_by_person.entry(ev.person_id.clone()).or_default().push(ev);
+    // Partition valid events into user shards
+    let mut user_event_shards: Vec<Vec<ValidEvent>> = (0..NUM_SHARDS).map(|_| Vec::new()).collect();
+    for shard in valid_event_shards {
+        for ev in shard {
+            let h = ahash_builder.hash_one(&ev.person_id);
+            let s_idx = (h as usize) % NUM_SHARDS;
+            user_event_shards[s_idx].push(ev);
+        }
     }
 
+    let clicks_arc = Arc::new(clicks_by_person);
+
+    // 7. Parallel Sessionization & Attribution across all user shards
     let session_results: Vec<(
-        Vec<((String, i32), (i64, i64, i64, HashMap<String, i64>))>,
+        Vec<((String, i32), (i64, i64, i64, HashMap<String, i64, ahash::RandomState>))>,
         Vec<((String, i32), (i64, i64, i64, i64))>,
-    )> = events_by_person
+    )> = user_event_shards
         .into_par_iter()
-        .map(|(person_id, mut ev_list)| {
-            ev_list.sort_unstable_by_key(|e| e.ts);
-
-            let mut sessions: Vec<Vec<ValidEvent>> = Vec::new();
-            let mut curr_sess: Vec<ValidEvent> = Vec::new();
-            let mut last_distinct_ts: Option<i64> = None;
-
-            for ev in ev_list {
-                let ts = ev.ts;
-                if curr_sess.is_empty() {
-                    curr_sess.push(ev);
-                    last_distinct_ts = Some(ts);
-                } else if Some(ts) == last_distinct_ts {
-                    curr_sess.push(ev);
-                } else if ts - last_distinct_ts.unwrap() > 1_800_000 {
-                    sessions.push(std::mem::take(&mut curr_sess));
-                    curr_sess.push(ev);
-                    last_distinct_ts = Some(ts);
-                } else {
-                    curr_sess.push(ev);
-                    last_distinct_ts = Some(ts);
-                }
-            }
-            if !curr_sess.is_empty() {
-                sessions.push(curr_sess);
+        .map(|shard_events| {
+            let mut events_by_person: HashMap<String, Vec<ValidEvent>, ahash::RandomState> = HashMap::default();
+            for ev in shard_events {
+                events_by_person.entry(ev.person_id.clone()).or_default().push(ev);
             }
 
-            let p_clicks = clicks_by_person.get(&person_id);
             let mut local_user_daily = Vec::new();
             let mut local_camp_events = Vec::new();
 
-            for sess in sessions {
-                let sess_start_ms = sess[0].ts;
-                let sess_day = (sess_start_ms / 86_400_000) as i32;
+            for (person_id, mut ev_list) in events_by_person {
+                ev_list.sort_unstable_by_key(|e| e.ts);
 
-                let sess_events_count = sess.len() as i64;
-                let mut sess_revenue = 0i64;
-                let mut sess_purchases = 0i64;
-                let mut sess_cat_spend: HashMap<String, i64> = HashMap::new();
+                let mut sessions: Vec<Vec<ValidEvent>> = Vec::new();
+                let mut curr_sess: Vec<ValidEvent> = Vec::new();
+                let mut last_distinct_ts: Option<i64> = None;
 
-                for ev in &sess {
-                    if ev.event_type == "purchase" {
-                        sess_revenue += ev.price_cents;
-                        sess_purchases += 1;
-                        *sess_cat_spend.entry(ev.category.clone()).or_default() += ev.price_cents;
+                for ev in ev_list {
+                    let ts = ev.ts;
+                    if curr_sess.is_empty() {
+                        curr_sess.push(ev);
+                        last_distinct_ts = Some(ts);
+                    } else if Some(ts) == last_distinct_ts {
+                        curr_sess.push(ev);
+                    } else if ts - last_distinct_ts.unwrap() > 1_800_000 {
+                        sessions.push(std::mem::take(&mut curr_sess));
+                        curr_sess.push(ev);
+                        last_distinct_ts = Some(ts);
+                    } else {
+                        curr_sess.push(ev);
+                        last_distinct_ts = Some(ts);
                     }
                 }
+                if !curr_sess.is_empty() {
+                    sessions.push(curr_sess);
+                }
 
-                local_user_daily.push((
-                    (person_id.clone(), sess_day),
-                    (1i64, sess_events_count, sess_revenue, sess_cat_spend),
-                ));
+                let p_clicks = clicks_arc.get(&person_id);
 
-                // Attribution
-                let min_click_ts = sess_start_ms - 604_800_000;
-                let mut eligible_clicks: Vec<&ValidClick> = Vec::new();
-                if let Some(clicks) = p_clicks {
-                    for c in clicks {
-                        if c.ts >= min_click_ts && c.ts <= sess_start_ms {
-                            eligible_clicks.push(c);
+                for sess in sessions {
+                    let sess_start_ms = sess[0].ts;
+                    let sess_day = (sess_start_ms / 86_400_000) as i32;
+
+                    let sess_events_count = sess.len() as i64;
+                    let mut sess_revenue = 0i64;
+                    let mut sess_purchases = 0i64;
+                    let mut sess_cat_spend: HashMap<String, i64, ahash::RandomState> = HashMap::default();
+
+                    for ev in &sess {
+                        if ev.event_type == "purchase" {
+                            sess_revenue += ev.price_cents;
+                            sess_purchases += 1;
+                            *sess_cat_spend.entry(ev.category.clone()).or_default() += ev.price_cents;
                         }
                     }
-                }
 
-                let mut credited_camp = "organic".to_string();
-                if !eligible_clicks.is_empty() {
-                    let best = eligible_clicks
-                        .iter()
-                        .min_by(|a, b| b.ts.cmp(&a.ts).then_with(|| a.click_id.cmp(&b.click_id)))
-                        .unwrap();
-                    credited_camp = best.campaign_id.clone();
-                }
+                    local_user_daily.push((
+                        (person_id.clone(), sess_day),
+                        (1i64, sess_events_count, sess_revenue, sess_cat_spend),
+                    ));
 
-                let mut assisting_camps: HashSet<String> = HashSet::new();
-                for c in eligible_clicks {
-                    assisting_camps.insert(c.campaign_id.clone());
-                }
+                    let min_click_ts = sess_start_ms - 604_800_000;
+                    let mut eligible_clicks: Vec<&ValidClick> = Vec::new();
+                    if let Some(clicks) = p_clicks {
+                        for c in clicks {
+                            if c.ts >= min_click_ts && c.ts <= sess_start_ms {
+                                eligible_clicks.push(c);
+                            }
+                        }
+                    }
 
-                let purch = if sess_purchases > 0 { 1i64 } else { 0i64 };
-                local_camp_events.push(((credited_camp, sess_day), (1i64, purch, sess_revenue, 0i64)));
+                    let mut credited_camp = "organic".to_string();
+                    if !eligible_clicks.is_empty() {
+                        let best = eligible_clicks
+                            .iter()
+                            .min_by(|a, b| b.ts.cmp(&a.ts).then_with(|| a.click_id.cmp(&b.click_id)))
+                            .unwrap();
+                        credited_camp = best.campaign_id.clone();
+                    }
 
-                for acamp in assisting_camps {
-                    local_camp_events.push(((acamp, sess_day), (0i64, 0i64, 0i64, 1i64)));
+                    let mut assisting_camps: HashSet<String, ahash::RandomState> = HashSet::default();
+                    for c in eligible_clicks {
+                        assisting_camps.insert(c.campaign_id.clone());
+                    }
+
+                    let purch = if sess_purchases > 0 { 1i64 } else { 0i64 };
+                    local_camp_events.push(((credited_camp, sess_day), (1i64, purch, sess_revenue, 0i64)));
+
+                    for acamp in assisting_camps {
+                        local_camp_events.push(((acamp, sess_day), (0i64, 0i64, 0i64, 1i64)));
+                    }
                 }
             }
 
@@ -670,8 +801,8 @@ fn main() {
         })
         .collect();
 
-    let mut user_daily_map: HashMap<(String, i32), UserDayAgg> = HashMap::new();
-    let mut campaign_daily_map: HashMap<(String, i32), CampDayAgg> = HashMap::new();
+    let mut user_daily_map: HashMap<(String, i32), UserDayAgg, ahash::RandomState> = HashMap::default();
+    let mut campaign_daily_map: HashMap<(String, i32), CampDayAgg, ahash::RandomState> = HashMap::default();
 
     for (user_records, camp_records) in session_results {
         for (ukey, (sess_cnt, ev_cnt, rev, cat_sp)) in user_records {
@@ -679,7 +810,7 @@ fn main() {
                 sessions: 0,
                 events: 0,
                 revenue_cents: 0,
-                cat_spend: HashMap::new(),
+                cat_spend: HashMap::default(),
             });
             uentry.sessions += sess_cnt;
             uentry.events += ev_cnt;
@@ -703,7 +834,7 @@ fn main() {
         }
     }
 
-    // 10. Write user_daily Parquet
+    // 8. Write user_daily Parquet
     let user_schema = Arc::new(Schema::new(vec![
         Field::new("user_id", DataType::Utf8, false),
         Field::new("day", DataType::Date32, false),
@@ -760,7 +891,7 @@ fn main() {
     u_writer.write(&u_batch).expect("Failed to write user batch");
     u_writer.close().expect("Failed to close user writer");
 
-    // 11. Write campaign_daily Parquet
+    // 9. Write campaign_daily Parquet
     let camp_schema = Arc::new(Schema::new(vec![
         Field::new("campaign_id", DataType::Utf8, false),
         Field::new("channel", DataType::Utf8, false),
@@ -783,7 +914,7 @@ fn main() {
         let channel = if cid == "organic" {
             "organic".to_string()
         } else {
-            campaigns.get(&cid).cloned().unwrap_or_default()
+            camp_arc.get(&cid).cloned().unwrap_or_default()
         };
         c_camp_ids.push(cid);
         c_channels.push(channel);
