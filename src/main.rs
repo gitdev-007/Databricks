@@ -262,10 +262,16 @@ impl Dsu {
         }
     }
 
-    fn get_canonical<'a>(&'a mut self, name: &'a str) -> String {
+    fn flatten(&mut self) {
+        for i in 0..self.parent.len() {
+            let root = self.find(i as u32);
+            self.canonical[i] = self.canonical[root as usize];
+        }
+    }
+
+    fn get_canonical(&self, name: &str) -> String {
         if let Some(&id) = self.name_to_id.get(name) {
-            let root = self.find(id);
-            let canon_id = self.canonical[root as usize];
+            let canon_id = self.canonical[id as usize];
             self.names[canon_id as usize].clone()
         } else {
             name.to_string()
@@ -403,6 +409,7 @@ fn main() {
             }
         }
     }
+    dsu.flatten();
 
     let ahash_builder = ahash::RandomState::with_seeds(11, 22, 33, 44);
 
@@ -552,11 +559,7 @@ fn main() {
                     }
 
                     let u_str = String::from_utf8_lossy(uid);
-                    // DSU lookup
-                    let person_id = {
-                        let mut dsu_clone = (*dsu_arc).clone();
-                        dsu_clone.get_canonical(&u_str)
-                    };
+                    let person_id = dsu_arc.get_canonical(&u_str);
                     let p_str = String::from_utf8_lossy(pid);
                     let category = prod_arc.get(p_str.as_ref()).cloned().unwrap_or_else(|| "unknown".into());
 
@@ -673,11 +676,10 @@ fn main() {
         .collect();
 
     // Group valid clicks by canonical person_id
-    let mut dsu_mut = (*dsu_arc).clone();
     let mut clicks_by_person: HashMap<String, Vec<ValidClick>, ahash::RandomState> = HashMap::default();
     for shard in valid_click_shards {
         for c in shard {
-            let person_id = dsu_mut.get_canonical(&c.user_id);
+            let person_id = dsu_arc.get_canonical(&c.user_id);
             clicks_by_person.entry(person_id).or_default().push(c);
         }
     }
