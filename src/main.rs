@@ -55,11 +55,15 @@ fn parse_csv_2<'a>(mut line: &'a [u8], out: &mut [&'a [u8]; 2]) -> bool {
         Some(pos) => pos,
         None => return false,
     };
+    let rest = &line[comma + 1..];
+    if memchr::memchr(b',', rest).is_some() {
+        return false;
+    }
     let f0 = match unquote_field(&line[..comma]) {
         Some(f) => f,
         None => return false,
     };
-    let f1 = match unquote_field(&line[comma + 1..]) {
+    let f1 = match unquote_field(rest) {
         Some(f) => f,
         None => return false,
     };
@@ -987,20 +991,16 @@ fn main() {
                         local_camp[credited_camp_id as usize][day_idx].purchasing_sessions += purch_val;
                         local_camp[credited_camp_id as usize][day_idx].revenue_cents += sess_revenue;
 
-                        let mut assisting_camps = [0u16; 32];
-                        let mut num_assisting = 0;
+                        let mut assisting_bitset = [0u64; 32];
                         for c in eligible {
                             if c.camp_id != 0 {
-                                if !assisting_camps[..num_assisting].contains(&c.camp_id) {
-                                    if num_assisting < 32 {
-                                        assisting_camps[num_assisting] = c.camp_id;
-                                        num_assisting += 1;
-                                    }
+                                let word = (c.camp_id >> 6) as usize;
+                                let bit = 1u64 << (c.camp_id & 63);
+                                if (assisting_bitset[word] & bit) == 0 {
+                                    assisting_bitset[word] |= bit;
+                                    local_camp[c.camp_id as usize][day_idx].assisted_sessions += 1;
                                 }
                             }
-                        }
-                        for &acamp in &assisting_camps[..num_assisting] {
-                            local_camp[acamp as usize][day_idx].assisted_sessions += 1;
                         }
                     }
 
