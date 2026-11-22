@@ -8,6 +8,8 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use hashbrown::HashMap;
 use memmap2::Mmap;
+#[cfg(unix)]
+use memmap2::Advice;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
@@ -22,6 +24,15 @@ const DAYS_BEFORE_MONTH_LEAP: [i64; 13] = [0, 0, 31, 60, 91, 121, 152, 182, 213,
 #[inline(always)]
 fn is_leap_year(y: i64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
+}
+
+#[inline(always)]
+fn fast_hash(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        h = (h ^ (b as u64)).wrapping_mul(0x100000001b3);
+    }
+    h
 }
 
 #[inline(always)]
@@ -401,7 +412,6 @@ fn list_csv_files(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
-const NUM_SHARDS: usize = 32;
 const MAX_DAYS: usize = 32;
 
 #[derive(Copy, Clone)]
@@ -480,7 +490,6 @@ fn parse_and_validate_event<'a>(
     window_end_ms: i64,
     products: &HashMap<&[u8], u8, ahash::RandomState>,
     dsu: &Dsu<'a>,
-    ahash_builder: &ahash::RandomState,
 ) -> Option<RawParsedEvent<'a>> {
     let mut fields = [b"".as_slice(); 7];
     if !parse_csv_7(line, &mut fields) {
@@ -536,7 +545,7 @@ fn parse_and_validate_event<'a>(
     }
 
     let person_hash = if is_valid {
-        ahash_builder.hash_one(canon_name)
+        fast_hash(canon_name)
     } else {
         0
     };
@@ -561,7 +570,6 @@ fn parse_and_validate_click<'a>(
     window_end_ms: i64,
     campaigns: &HashMap<&[u8], u16, ahash::RandomState>,
     dsu: &Dsu<'a>,
-    ahash_builder: &ahash::RandomState,
 ) -> Option<RawParsedClick<'a>> {
     let mut fields = [b"".as_slice(); 4];
     if !parse_csv_4(line, &mut fields) {
@@ -594,7 +602,7 @@ fn parse_and_validate_click<'a>(
     }
 
     let person_hash = if is_valid {
-        ahash_builder.hash_one(canon_name)
+        fast_hash(canon_name)
     } else {
         0
     };
@@ -615,6 +623,17 @@ fn main() {
         .unwrap_or_else(|_| if args.len() > 1 { args[1].clone() } else { "/data".into() });
     let out_dir = std::env::var("OUTPUT_DIR")
         .unwrap_or_else(|_| if args.len() > 2 { args[2].clone() } else { "/output".into() });
+
+    let ncpu: usize = std::env::var("NCPU")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8));
+
+    let _ = rayon::ThreadPoolBuilder::new()
+        .num_threads(ncpu)
+        .build_global();
+
+    let num_shards = ncpu.max(8);
 
     let data_path = Path::new(&data_dir);
     let out_path = Path::new(&out_dir);
@@ -693,7 +712,7 @@ fn main() {
     // 4. Read links/*.csv into DSU with Mmap
     let link_files = list_csv_files(&data_path.join("links"));
     let link_mmaps: Vec<Mmap> = link_files
-        .iter()
+        .par_iter()
         .filter_map(|lf| {
             let f = File::open(lf).ok()?;
             unsafe { Mmap::map(&f).ok() }
@@ -702,6 +721,8 @@ fn main() {
 
     let mut dsu = Dsu::new();
     for mmap in &link_mmaps {
+        #[cfg(unix)]
+        let _ = mmap.advise(Advice::Sequential);
         let mut lines = mmap.split(|&b| b == b'\n');
         lines.next();
         let mut fields = [b"".as_slice(); 2];
@@ -715,15 +736,19 @@ fn main() {
     }
     dsu.flatten();
 
-    let ahash_builder = ahash::RandomState::with_seeds(11, 22, 33, 44);
-
     // 5. Ingest Event files in Parallel with Mmap & Single-Pass Parse
     let event_files = list_csv_files(&data_path.join("events"));
     let event_mmaps: Vec<Mmap> = event_files
-        .iter()
+        .par_iter()
         .filter_map(|ef| {
             let f = File::open(ef).ok()?;
-            unsafe { Mmap::map(&f).ok() }
+            let mmap = unsafe { Mmap::map(&f).ok()? };
+            #[cfg(unix)]
+            {
+                let _ = mmap.advise(Advice::Sequential);
+                let _ = mmap.advise(Advice::WillNeed);
+            }
+            Some(mmap)
         })
         .collect();
 
@@ -736,8 +761,8 @@ fn main() {
             }
             let bytes = &mmap[start..];
             let file_est_lines = bytes.len() / 55;
-            let per_shard_est = (file_est_lines / NUM_SHARDS) + 128;
-            let mut shards: Vec<Vec<RawParsedEvent>> = (0..NUM_SHARDS)
+            let per_shard_est = (file_est_lines / num_shards) + 128;
+            let mut shards: Vec<Vec<RawParsedEvent>> = (0..num_shards)
                 .map(|_| Vec::with_capacity(per_shard_est))
                 .collect();
             for line in bytes.split(|&b| b == b'\n') {
@@ -750,10 +775,9 @@ fn main() {
                     window_end_ms,
                     &products,
                     &dsu,
-                    &ahash_builder,
                 ) {
-                    let h = ahash_builder.hash_one(ev.eid);
-                    let shard_idx = (h as usize) % NUM_SHARDS;
+                    let h = fast_hash(ev.eid);
+                    let shard_idx = (h as usize) % num_shards;
                     shards[shard_idx].push(ev);
                 }
             }
@@ -762,7 +786,7 @@ fn main() {
         .collect();
 
     // Parallel Transpose of Event EID Shards
-    let combined_eid_shards: Vec<Vec<RawParsedEvent>> = (0..NUM_SHARDS)
+    let combined_eid_shards: Vec<Vec<RawParsedEvent>> = (0..num_shards)
         .into_par_iter()
         .map(|s| {
             let mut total_len = 0;
@@ -783,8 +807,8 @@ fn main() {
         .into_par_iter()
         .map(|mut shard| {
             shard.sort_unstable_by(|a, b| a.eid.cmp(b.eid).then_with(|| a.ingest_ms.cmp(&b.ingest_ms)));
-            let per_p_est = (shard.len() / NUM_SHARDS) + 128;
-            let mut person_buckets: Vec<Vec<ShardEvent>> = (0..NUM_SHARDS)
+            let per_p_est = (shard.len() / num_shards) + 128;
+            let mut person_buckets: Vec<Vec<ShardEvent>> = (0..num_shards)
                 .map(|_| Vec::with_capacity(per_p_est))
                 .collect();
             let mut i = 0;
@@ -796,7 +820,7 @@ fn main() {
                     next_i += 1;
                 }
                 if kept.is_valid {
-                    let p_shard = (kept.person_hash as usize) % NUM_SHARDS;
+                    let p_shard = (kept.person_hash as usize) % num_shards;
                     person_buckets[p_shard].push(ShardEvent {
                         person_hash: kept.person_hash,
                         canon_name: kept.canon_name,
@@ -813,7 +837,7 @@ fn main() {
         .collect();
 
     // Transpose Events to Person Shards
-    let person_event_shards: Vec<Vec<ShardEvent>> = (0..NUM_SHARDS)
+    let person_event_shards: Vec<Vec<ShardEvent>> = (0..num_shards)
         .into_par_iter()
         .map(|p| {
             let mut total = 0;
@@ -832,10 +856,16 @@ fn main() {
     // 7. Ingest & Dedup Clicks with Mmap & Single-Pass Parse
     let click_files = list_csv_files(&data_path.join("clicks"));
     let click_mmaps: Vec<Mmap> = click_files
-        .iter()
+        .par_iter()
         .filter_map(|cf| {
             let f = File::open(cf).ok()?;
-            unsafe { Mmap::map(&f).ok() }
+            let mmap = unsafe { Mmap::map(&f).ok()? };
+            #[cfg(unix)]
+            {
+                let _ = mmap.advise(Advice::Sequential);
+                let _ = mmap.advise(Advice::WillNeed);
+            }
+            Some(mmap)
         })
         .collect();
 
@@ -848,8 +878,8 @@ fn main() {
             }
             let bytes = &mmap[start..];
             let file_est_lines = bytes.len() / 45;
-            let per_shard_est = (file_est_lines / NUM_SHARDS) + 128;
-            let mut shards: Vec<Vec<RawParsedClick>> = (0..NUM_SHARDS)
+            let per_shard_est = (file_est_lines / num_shards) + 128;
+            let mut shards: Vec<Vec<RawParsedClick>> = (0..num_shards)
                 .map(|_| Vec::with_capacity(per_shard_est))
                 .collect();
             for line in bytes.split(|&b| b == b'\n') {
@@ -862,10 +892,9 @@ fn main() {
                     window_end_ms,
                     &campaigns,
                     &dsu,
-                    &ahash_builder,
                 ) {
-                    let h = ahash_builder.hash_one(clk.cid);
-                    let shard_idx = (h as usize) % NUM_SHARDS;
+                    let h = fast_hash(clk.cid);
+                    let shard_idx = (h as usize) % num_shards;
                     shards[shard_idx].push(clk);
                 }
             }
@@ -873,7 +902,7 @@ fn main() {
         })
         .collect();
 
-    let combined_cid_shards: Vec<Vec<RawParsedClick>> = (0..NUM_SHARDS)
+    let combined_cid_shards: Vec<Vec<RawParsedClick>> = (0..num_shards)
         .into_par_iter()
         .map(|s| {
             let mut total_len = 0;
@@ -893,8 +922,8 @@ fn main() {
         .into_par_iter()
         .map(|mut shard| {
             shard.sort_unstable_by(|a, b| a.cid.cmp(b.cid));
-            let per_p_est = (shard.len() / NUM_SHARDS) + 128;
-            let mut person_buckets: Vec<Vec<ShardClick>> = (0..NUM_SHARDS)
+            let per_p_est = (shard.len() / num_shards) + 128;
+            let mut person_buckets: Vec<Vec<ShardClick>> = (0..num_shards)
                 .map(|_| Vec::with_capacity(per_p_est))
                 .collect();
             let mut i = 0;
@@ -906,7 +935,7 @@ fn main() {
                     next_i += 1;
                 }
                 if kept.is_valid {
-                    let p_shard = (kept.person_hash as usize) % NUM_SHARDS;
+                    let p_shard = (kept.person_hash as usize) % num_shards;
                     person_buckets[p_shard].push(ShardClick {
                         person_hash: kept.person_hash,
                         canon_name: kept.canon_name,
@@ -922,7 +951,7 @@ fn main() {
         .collect();
 
     // Transpose Clicks to Person Shards
-    let person_click_shards: Vec<Vec<ShardClick>> = (0..NUM_SHARDS)
+    let person_click_shards: Vec<Vec<ShardClick>> = (0..num_shards)
         .into_par_iter()
         .map(|p| {
             let mut total = 0;
