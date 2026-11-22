@@ -1,5 +1,6 @@
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Date32Array, Int64Array, StringBuilder};
@@ -80,33 +81,27 @@ fn parse_csv_4<'a>(mut line: &'a [u8], out: &mut [&'a [u8]; 4]) -> bool {
     if line.is_empty() {
         return false;
     }
-    let mut field_idx = 0;
     let mut start = 0;
-    let len = line.len();
-    for i in 0..len {
-        if line[i] == b',' {
-            if field_idx >= 4 {
-                return false;
-            }
-            let part = &line[start..i];
-            let unquoted = match unquote_field(part) {
-                Some(p) => p,
-                None => return false,
-            };
-            out[field_idx] = unquoted;
-            field_idx += 1;
-            start = i + 1;
-        }
+    for i in 0..3 {
+        let comma = match memchr::memchr(b',', &line[start..]) {
+            Some(c) => start + c,
+            None => return false,
+        };
+        let part = &line[start..comma];
+        out[i] = match unquote_field(part) {
+            Some(p) => p,
+            None => return false,
+        };
+        start = comma + 1;
     }
-    if field_idx != 3 {
+    let rest = &line[start..];
+    if memchr::memchr(b',', rest).is_some() {
         return false;
     }
-    let part = &line[start..len];
-    let unquoted = match unquote_field(part) {
+    out[3] = match unquote_field(rest) {
         Some(p) => p,
         None => return false,
     };
-    out[3] = unquoted;
     true
 }
 
@@ -118,33 +113,27 @@ fn parse_csv_7<'a>(mut line: &'a [u8], out: &mut [&'a [u8]; 7]) -> bool {
     if line.is_empty() {
         return false;
     }
-    let mut field_idx = 0;
     let mut start = 0;
-    let len = line.len();
-    for i in 0..len {
-        if line[i] == b',' {
-            if field_idx >= 7 {
-                return false;
-            }
-            let part = &line[start..i];
-            let unquoted = match unquote_field(part) {
-                Some(p) => p,
-                None => return false,
-            };
-            out[field_idx] = unquoted;
-            field_idx += 1;
-            start = i + 1;
-        }
+    for i in 0..6 {
+        let comma = match memchr::memchr(b',', &line[start..]) {
+            Some(c) => start + c,
+            None => return false,
+        };
+        let part = &line[start..comma];
+        out[i] = match unquote_field(part) {
+            Some(p) => p,
+            None => return false,
+        };
+        start = comma + 1;
     }
-    if field_idx != 6 {
+    let rest = &line[start..];
+    if memchr::memchr(b',', rest).is_some() {
         return false;
     }
-    let part = &line[start..len];
-    let unquoted = match unquote_field(part) {
+    out[6] = match unquote_field(rest) {
         Some(p) => p,
         None => return false,
     };
-    out[6] = unquoted;
     true
 }
 
@@ -297,14 +286,35 @@ fn parse_timestamp(s: &[u8]) -> Option<i64> {
     }
 }
 
-struct Dsu {
-    names: Vec<Vec<u8>>,
-    name_to_id: HashMap<Vec<u8>, u32, ahash::RandomState>,
+#[inline(always)]
+fn parse_price(s: &[u8]) -> Option<i32> {
+    if s.is_empty() {
+        return None;
+    }
+    let mut p = 0i32;
+    for &b in s {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        p = match p.checked_mul(10).and_then(|v| v.checked_add((b - b'0') as i32)) {
+            Some(v) => v,
+            None => return None,
+        };
+    }
+    if p < 1 || p > 10_000_000 {
+        return None;
+    }
+    Some(p)
+}
+
+struct Dsu<'a> {
+    names: Vec<&'a [u8]>,
+    name_to_id: HashMap<&'a [u8], u32, ahash::RandomState>,
     parent: Vec<u32>,
     canonical: Vec<u32>,
 }
 
-impl Dsu {
+impl<'a> Dsu<'a> {
     fn new() -> Self {
         Self {
             names: Vec::new(),
@@ -314,14 +324,13 @@ impl Dsu {
         }
     }
 
-    fn get_or_create(&mut self, name: &[u8]) -> u32 {
+    fn get_or_create(&mut self, name: &'a [u8]) -> u32 {
         if let Some(&id) = self.name_to_id.get(name) {
             id
         } else {
             let id = self.names.len() as u32;
-            let vec_name = name.to_vec();
-            self.names.push(vec_name.clone());
-            self.name_to_id.insert(vec_name, id);
+            self.names.push(name);
+            self.name_to_id.insert(name, id);
             self.parent.push(id);
             self.canonical.push(id);
             id
@@ -340,7 +349,7 @@ impl Dsu {
         x
     }
 
-    fn union(&mut self, a: &[u8], b: &[u8]) {
+    fn union(&mut self, a: &'a [u8], b: &'a [u8]) {
         let u = self.get_or_create(a);
         let v = self.get_or_create(b);
         let ru = self.find(u);
@@ -366,10 +375,10 @@ impl Dsu {
     }
 
     #[inline(always)]
-    fn get_canonical<'a>(&'a self, uid: &'a [u8]) -> &'a [u8] {
+    fn get_canonical(&self, uid: &'a [u8]) -> &'a [u8] {
         if let Some(&id) = self.name_to_id.get(uid) {
             let canon_id = self.canonical[id as usize];
-            &self.names[canon_id as usize]
+            self.names[canon_id as usize]
         } else {
             uid
         }
@@ -392,20 +401,30 @@ fn list_csv_files(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
-const NUM_SHARDS: usize = 64;
+const NUM_SHARDS: usize = 32;
 const MAX_DAYS: usize = 32;
 
 #[derive(Copy, Clone)]
-struct RawEventRef<'a> {
+struct RawParsedEvent<'a> {
     eid: &'a [u8],
-    line: &'a [u8],
     ingest_ms: i64,
+    canon_name: &'a [u8],
+    person_hash: u64,
+    ts: i64,
+    price_cents: i32,
+    cat_id: u8,
+    is_purchase: bool,
+    is_valid: bool,
 }
 
 #[derive(Copy, Clone)]
-struct RawClickRef<'a> {
+struct RawParsedClick<'a> {
     cid: &'a [u8],
-    line: &'a [u8],
+    canon_name: &'a [u8],
+    person_hash: u64,
+    ts: i64,
+    camp_id: u16,
+    is_valid: bool,
 }
 
 #[derive(Copy, Clone)]
@@ -454,6 +473,142 @@ struct UserDayRow<'a> {
     top_cat_id: Option<u8>,
 }
 
+#[inline(always)]
+fn parse_and_validate_event<'a>(
+    line: &'a [u8],
+    window_start_ms: i64,
+    window_end_ms: i64,
+    products: &HashMap<&[u8], u8, ahash::RandomState>,
+    dsu: &Dsu<'a>,
+    ahash_builder: &ahash::RandomState,
+) -> Option<RawParsedEvent<'a>> {
+    let mut fields = [b"".as_slice(); 7];
+    if !parse_csv_7(line, &mut fields) {
+        return None;
+    }
+    let eid = fields[0];
+    if eid.is_empty() {
+        return None;
+    }
+    let ingest_ms = match parse_iso_f1(fields[3]) {
+        Some(t) => t,
+        None => return None,
+    };
+
+    let uid = fields[1];
+    let ts_opt = parse_timestamp(fields[2]);
+    let etype = fields[4];
+    let pid = fields[5];
+    let price_str = fields[6];
+
+    let mut is_valid = false;
+    let mut is_purchase = false;
+    let mut price_cents = 0i32;
+    let mut cat_id = 0u8;
+    let mut ts = 0i64;
+    let mut canon_name = uid;
+
+    if !uid.is_empty() && !pid.is_empty() {
+        if let Some(t) = ts_opt {
+            if t >= window_start_ms && t < window_end_ms {
+                if ingest_ms - t <= 86_400_000 {
+                    if etype == b"purchase" {
+                        if let Some(p) = parse_price(price_str) {
+                            is_valid = true;
+                            is_purchase = true;
+                            price_cents = p;
+                            ts = t;
+                        }
+                    } else if etype == b"view" || etype == b"cart" {
+                        is_valid = true;
+                        ts = t;
+                    }
+                }
+            }
+        }
+    }
+
+    if is_valid {
+        canon_name = dsu.get_canonical(uid);
+        if let Some(&cid) = products.get(pid) {
+            cat_id = cid;
+        }
+    }
+
+    let person_hash = if is_valid {
+        ahash_builder.hash_one(canon_name)
+    } else {
+        0
+    };
+
+    Some(RawParsedEvent {
+        eid,
+        ingest_ms,
+        canon_name,
+        person_hash,
+        ts,
+        price_cents,
+        cat_id,
+        is_purchase,
+        is_valid,
+    })
+}
+
+#[inline(always)]
+fn parse_and_validate_click<'a>(
+    line: &'a [u8],
+    click_window_start_ms: i64,
+    window_end_ms: i64,
+    campaigns: &HashMap<&[u8], u16, ahash::RandomState>,
+    dsu: &Dsu<'a>,
+    ahash_builder: &ahash::RandomState,
+) -> Option<RawParsedClick<'a>> {
+    let mut fields = [b"".as_slice(); 4];
+    if !parse_csv_4(line, &mut fields) {
+        return None;
+    }
+    let cid = fields[0];
+    if cid.is_empty() {
+        return None;
+    }
+    let uid = fields[1];
+    let camp_str = fields[2];
+    let ts_str = fields[3];
+
+    let mut is_valid = false;
+    let mut ts = 0i64;
+    let mut camp_id = 0u16;
+    let mut canon_name = uid;
+
+    if !uid.is_empty() {
+        if let Some(t) = parse_timestamp(ts_str) {
+            if t >= click_window_start_ms && t < window_end_ms {
+                if let Some(&c) = campaigns.get(camp_str) {
+                    is_valid = true;
+                    ts = t;
+                    camp_id = c;
+                    canon_name = dsu.get_canonical(uid);
+                }
+            }
+        }
+    }
+
+    let person_hash = if is_valid {
+        ahash_builder.hash_one(canon_name)
+    } else {
+        0
+    };
+
+    Some(RawParsedClick {
+        cid,
+        canon_name,
+        person_hash,
+        ts,
+        camp_id,
+        is_valid,
+    })
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let data_dir = std::env::var("DATA_DIR")
@@ -474,69 +629,86 @@ fn main() {
     let click_window_start_ms = window_start_ms - 7 * 86400 * 1000;
     let min_day = (window_start_ms / 86_400_000) as i32;
 
-    // 2. Read products.csv
-    let mut cat_names: Vec<String> = vec!["unknown".to_string()];
-    let mut cat_index_map: HashMap<Vec<u8>, u8, ahash::RandomState> = HashMap::default();
-    let mut products: HashMap<Vec<u8>, u8, ahash::RandomState> = HashMap::default();
-
+    // 2. Read products.csv with Mmap
     let prod_file = data_path.join("products.csv");
-    if prod_file.exists() {
-        if let Ok(content) = fs::read(&prod_file) {
-            let mut lines = content.split(|&b| b == b'\n');
-            lines.next();
-            let mut fields = [b"".as_slice(); 2];
-            for line in lines {
-                if parse_csv_2(line, &mut fields) {
-                    let cat = fields[1];
-                    let cid = if let Some(&c) = cat_index_map.get(cat) {
-                        c
-                    } else {
-                        let c = cat_names.len() as u8;
-                        cat_names.push(String::from_utf8_lossy(cat).to_string());
-                        cat_index_map.insert(cat.to_vec(), c);
-                        c
-                    };
-                    products.insert(fields[0].to_vec(), cid);
-                }
+    let prod_mmap = if prod_file.exists() {
+        let f = File::open(&prod_file).ok();
+        f.and_then(|file| unsafe { Mmap::map(&file).ok() })
+    } else {
+        None
+    };
+
+    let mut cat_names: Vec<String> = vec!["unknown".to_string()];
+    let mut cat_index_map: HashMap<&[u8], u8, ahash::RandomState> = HashMap::default();
+    let mut products: HashMap<&[u8], u8, ahash::RandomState> = HashMap::default();
+
+    if let Some(ref mmap) = prod_mmap {
+        let mut lines = mmap.split(|&b| b == b'\n');
+        lines.next();
+        let mut fields = [b"".as_slice(); 2];
+        for line in lines {
+            if parse_csv_2(line, &mut fields) {
+                let cat = fields[1];
+                let cid = if let Some(&c) = cat_index_map.get(cat) {
+                    c
+                } else {
+                    let c = cat_names.len() as u8;
+                    cat_names.push(String::from_utf8_lossy(cat).to_string());
+                    cat_index_map.insert(cat, c);
+                    c
+                };
+                products.insert(fields[0], cid);
             }
         }
     }
 
-    // 3. Read campaigns.csv
+    // 3. Read campaigns.csv with Mmap
+    let camp_file = data_path.join("campaigns.csv");
+    let camp_mmap = if camp_file.exists() {
+        let f = File::open(&camp_file).ok();
+        f.and_then(|file| unsafe { Mmap::map(&file).ok() })
+    } else {
+        None
+    };
+
     let mut camp_names: Vec<String> = vec!["organic".to_string()];
     let mut chan_names: Vec<String> = vec!["organic".to_string()];
-    let mut campaigns: HashMap<Vec<u8>, u16, ahash::RandomState> = HashMap::default();
+    let mut campaigns: HashMap<&[u8], u16, ahash::RandomState> = HashMap::default();
 
-    let camp_file = data_path.join("campaigns.csv");
-    if camp_file.exists() {
-        if let Ok(content) = fs::read(&camp_file) {
-            let mut lines = content.split(|&b| b == b'\n');
-            lines.next();
-            let mut fields = [b"".as_slice(); 2];
-            for line in lines {
-                if parse_csv_2(line, &mut fields) {
-                    let cid = camp_names.len() as u16;
-                    camp_names.push(String::from_utf8_lossy(fields[0]).to_string());
-                    chan_names.push(String::from_utf8_lossy(fields[1]).to_string());
-                    campaigns.insert(fields[0].to_vec(), cid);
-                }
+    if let Some(ref mmap) = camp_mmap {
+        let mut lines = mmap.split(|&b| b == b'\n');
+        lines.next();
+        let mut fields = [b"".as_slice(); 2];
+        for line in lines {
+            if parse_csv_2(line, &mut fields) {
+                let cid = camp_names.len() as u16;
+                camp_names.push(String::from_utf8_lossy(fields[0]).to_string());
+                chan_names.push(String::from_utf8_lossy(fields[1]).to_string());
+                campaigns.insert(fields[0], cid);
             }
         }
     }
     let num_campaigns = camp_names.len();
 
-    // 4. Read links/*.csv into DSU
+    // 4. Read links/*.csv into DSU with Mmap
+    let link_files = list_csv_files(&data_path.join("links"));
+    let link_mmaps: Vec<Mmap> = link_files
+        .iter()
+        .filter_map(|lf| {
+            let f = File::open(lf).ok()?;
+            unsafe { Mmap::map(&f).ok() }
+        })
+        .collect();
+
     let mut dsu = Dsu::new();
-    for lf in list_csv_files(&data_path.join("links")) {
-        if let Ok(content) = fs::read(&lf) {
-            let mut lines = content.split(|&b| b == b'\n');
-            lines.next();
-            let mut fields = [b"".as_slice(); 2];
-            for line in lines {
-                if parse_csv_2(line, &mut fields) {
-                    if !fields[0].is_empty() && !fields[1].is_empty() {
-                        dsu.union(fields[0], fields[1]);
-                    }
+    for mmap in &link_mmaps {
+        let mut lines = mmap.split(|&b| b == b'\n');
+        lines.next();
+        let mut fields = [b"".as_slice(); 2];
+        for line in lines {
+            if parse_csv_2(line, &mut fields) {
+                if !fields[0].is_empty() && !fields[1].is_empty() {
+                    dsu.union(fields[0], fields[1]);
                 }
             }
         }
@@ -545,7 +717,7 @@ fn main() {
 
     let ahash_builder = ahash::RandomState::with_seeds(11, 22, 33, 44);
 
-    // 5. Ingest Event files in Parallel with Mmap
+    // 5. Ingest Event files in Parallel with Mmap & Single-Pass Parse
     let event_files = list_csv_files(&data_path.join("events"));
     let event_mmaps: Vec<Mmap> = event_files
         .iter()
@@ -555,37 +727,42 @@ fn main() {
         })
         .collect();
 
-    let per_file_event_shards: Vec<Vec<Vec<RawEventRef>>> = event_mmaps
+    let per_file_event_shards: Vec<Vec<Vec<RawParsedEvent>>> = event_mmaps
         .par_iter()
         .map(|mmap| {
-            let mut shards: Vec<Vec<RawEventRef>> = (0..NUM_SHARDS).map(|_| Vec::new()).collect();
             let mut start = 0;
             if let Some(first_nl) = memchr::memchr(b'\n', mmap) {
                 start = first_nl + 1;
             }
             let bytes = &mmap[start..];
-            let mut fields = [b"".as_slice(); 7];
+            let file_est_lines = bytes.len() / 55;
+            let per_shard_est = (file_est_lines / NUM_SHARDS) + 128;
+            let mut shards: Vec<Vec<RawParsedEvent>> = (0..NUM_SHARDS)
+                .map(|_| Vec::with_capacity(per_shard_est))
+                .collect();
             for line in bytes.split(|&b| b == b'\n') {
                 if line.is_empty() {
                     continue;
                 }
-                if parse_csv_7(line, &mut fields) {
-                    let eid = fields[0];
-                    if !eid.is_empty() {
-                        if let Some(ingest_ms) = parse_iso_f1(fields[3]) {
-                            let h = ahash_builder.hash_one(eid);
-                            let shard_idx = (h as usize) % NUM_SHARDS;
-                            shards[shard_idx].push(RawEventRef { eid, line, ingest_ms });
-                        }
-                    }
+                if let Some(ev) = parse_and_validate_event(
+                    line,
+                    window_start_ms,
+                    window_end_ms,
+                    &products,
+                    &dsu,
+                    &ahash_builder,
+                ) {
+                    let h = ahash_builder.hash_one(ev.eid);
+                    let shard_idx = (h as usize) % NUM_SHARDS;
+                    shards[shard_idx].push(ev);
                 }
             }
             shards
         })
         .collect();
 
-    // Parallel Transpose of Event Shards
-    let combined_eid_shards: Vec<Vec<RawEventRef>> = (0..NUM_SHARDS)
+    // Parallel Transpose of Event EID Shards
+    let combined_eid_shards: Vec<Vec<RawParsedEvent>> = (0..NUM_SHARDS)
         .into_par_iter()
         .map(|s| {
             let mut total_len = 0;
@@ -599,99 +776,38 @@ fn main() {
             shard
         })
         .collect();
+    drop(per_file_event_shards);
 
-    // 6. Deduplicate Events on eid & Partition by canon_name Hash
-    let dsu_arc = Arc::new(dsu);
-    let prod_arc = Arc::new(products);
-
+    // 6. Dedup Events on eid via Sort & Partition to Person Shards
     let dedup_event_shards: Vec<Vec<Vec<ShardEvent>>> = combined_eid_shards
         .into_par_iter()
-        .map(|raw_events| {
-            let mut dedup_map: HashMap<&[u8], RawEventRef, ahash::RandomState> =
-                HashMap::with_capacity_and_hasher(raw_events.len(), ahash_builder.clone());
-            for r in raw_events {
-                match dedup_map.entry(r.eid) {
-                    hashbrown::hash_map::Entry::Occupied(mut occ) => {
-                        if r.ingest_ms < occ.get().ingest_ms {
-                            occ.insert(r);
-                        }
-                    }
-                    hashbrown::hash_map::Entry::Vacant(vac) => {
-                        vac.insert(r);
-                    }
+        .map(|mut shard| {
+            shard.sort_unstable_by(|a, b| a.eid.cmp(b.eid).then_with(|| a.ingest_ms.cmp(&b.ingest_ms)));
+            let per_p_est = (shard.len() / NUM_SHARDS) + 128;
+            let mut person_buckets: Vec<Vec<ShardEvent>> = (0..NUM_SHARDS)
+                .map(|_| Vec::with_capacity(per_p_est))
+                .collect();
+            let mut i = 0;
+            let n = shard.len();
+            while i < n {
+                let kept = &shard[i];
+                let mut next_i = i + 1;
+                while next_i < n && shard[next_i].eid == kept.eid {
+                    next_i += 1;
                 }
+                if kept.is_valid {
+                    let p_shard = (kept.person_hash as usize) % NUM_SHARDS;
+                    person_buckets[p_shard].push(ShardEvent {
+                        person_hash: kept.person_hash,
+                        canon_name: kept.canon_name,
+                        ts: kept.ts,
+                        price_cents: kept.price_cents,
+                        cat_id: kept.cat_id,
+                        is_purchase: kept.is_purchase,
+                    });
+                }
+                i = next_i;
             }
-
-            let mut person_buckets: Vec<Vec<ShardEvent>> = (0..NUM_SHARDS).map(|_| Vec::new()).collect();
-            let mut fields = [b"".as_slice(); 7];
-
-            for (_eid, r) in dedup_map {
-                if !parse_csv_7(r.line, &mut fields) {
-                    continue;
-                }
-                let uid = fields[1];
-                if uid.is_empty() {
-                    continue;
-                }
-                let ts = match parse_timestamp(fields[2]) {
-                    Some(t) if t >= window_start_ms && t < window_end_ms => t,
-                    _ => continue,
-                };
-                let etype_bytes = fields[4];
-                let is_purchase = etype_bytes == b"purchase";
-                if !is_purchase && etype_bytes != b"view" && etype_bytes != b"cart" {
-                    continue;
-                }
-                let pid = fields[5];
-                if pid.is_empty() {
-                    continue;
-                }
-                let mut price_cents = 0i32;
-                if is_purchase {
-                    let p_bytes = fields[6];
-                    if p_bytes.is_empty() {
-                        continue;
-                    }
-                    let mut p = 0i32;
-                    let mut ok = true;
-                    for &b in p_bytes {
-                        if !b.is_ascii_digit() {
-                            ok = false;
-                            break;
-                        }
-                        p = match p.checked_mul(10).and_then(|v| v.checked_add((b - b'0') as i32)) {
-                            Some(v) => v,
-                            None => {
-                                ok = false;
-                                break;
-                            }
-                        };
-                    }
-                    if !ok || p < 1 || p > 10_000_000 {
-                        continue;
-                    }
-                    price_cents = p;
-                }
-
-                if r.ingest_ms - ts > 86_400_000 {
-                    continue;
-                }
-
-                let canon_name = dsu_arc.get_canonical(uid);
-                let person_hash = ahash_builder.hash_one(canon_name);
-                let cat_id = prod_arc.get(pid).copied().unwrap_or(0);
-
-                let p_shard = (person_hash as usize) % NUM_SHARDS;
-                person_buckets[p_shard].push(ShardEvent {
-                    person_hash,
-                    canon_name,
-                    ts,
-                    price_cents,
-                    cat_id,
-                    is_purchase,
-                });
-            }
-
             person_buckets
         })
         .collect();
@@ -711,8 +827,9 @@ fn main() {
             shard
         })
         .collect();
+    drop(dedup_event_shards);
 
-    // 7. Ingest & Dedup Clicks
+    // 7. Ingest & Dedup Clicks with Mmap & Single-Pass Parse
     let click_files = list_csv_files(&data_path.join("clicks"));
     let click_mmaps: Vec<Mmap> = click_files
         .iter()
@@ -722,34 +839,41 @@ fn main() {
         })
         .collect();
 
-    let per_file_click_shards: Vec<Vec<Vec<RawClickRef>>> = click_mmaps
+    let per_file_click_shards: Vec<Vec<Vec<RawParsedClick>>> = click_mmaps
         .par_iter()
         .map(|mmap| {
-            let mut shards: Vec<Vec<RawClickRef>> = (0..NUM_SHARDS).map(|_| Vec::new()).collect();
             let mut start = 0;
             if let Some(first_nl) = memchr::memchr(b'\n', mmap) {
                 start = first_nl + 1;
             }
             let bytes = &mmap[start..];
-            let mut fields = [b"".as_slice(); 4];
+            let file_est_lines = bytes.len() / 45;
+            let per_shard_est = (file_est_lines / NUM_SHARDS) + 128;
+            let mut shards: Vec<Vec<RawParsedClick>> = (0..NUM_SHARDS)
+                .map(|_| Vec::with_capacity(per_shard_est))
+                .collect();
             for line in bytes.split(|&b| b == b'\n') {
                 if line.is_empty() {
                     continue;
                 }
-                if parse_csv_4(line, &mut fields) {
-                    let cid = fields[0];
-                    if !cid.is_empty() {
-                        let h = ahash_builder.hash_one(cid);
-                        let shard_idx = (h as usize) % NUM_SHARDS;
-                        shards[shard_idx].push(RawClickRef { cid, line });
-                    }
+                if let Some(clk) = parse_and_validate_click(
+                    line,
+                    click_window_start_ms,
+                    window_end_ms,
+                    &campaigns,
+                    &dsu,
+                    &ahash_builder,
+                ) {
+                    let h = ahash_builder.hash_one(clk.cid);
+                    let shard_idx = (h as usize) % NUM_SHARDS;
+                    shards[shard_idx].push(clk);
                 }
             }
             shards
         })
         .collect();
 
-    let combined_cid_shards: Vec<Vec<RawClickRef>> = (0..NUM_SHARDS)
+    let combined_cid_shards: Vec<Vec<RawParsedClick>> = (0..NUM_SHARDS)
         .into_par_iter()
         .map(|s| {
             let mut total_len = 0;
@@ -763,55 +887,36 @@ fn main() {
             shard
         })
         .collect();
-
-    let camp_arc = Arc::new(campaigns);
+    drop(per_file_click_shards);
 
     let dedup_click_shards: Vec<Vec<Vec<ShardClick>>> = combined_cid_shards
         .into_par_iter()
-        .map(|raw_clicks| {
-            let mut dedup_map: HashMap<&[u8], RawClickRef, ahash::RandomState> =
-                HashMap::with_capacity_and_hasher(raw_clicks.len(), ahash_builder.clone());
-            for r in raw_clicks {
-                dedup_map.entry(r.cid).or_insert(r);
-            }
-
-            let mut person_buckets: Vec<Vec<ShardClick>> = (0..NUM_SHARDS).map(|_| Vec::new()).collect();
-            let mut fields = [b"".as_slice(); 4];
-
-            for (_cid, r) in dedup_map {
-                if !parse_csv_4(r.line, &mut fields) {
-                    continue;
+        .map(|mut shard| {
+            shard.sort_unstable_by(|a, b| a.cid.cmp(b.cid));
+            let per_p_est = (shard.len() / NUM_SHARDS) + 128;
+            let mut person_buckets: Vec<Vec<ShardClick>> = (0..NUM_SHARDS)
+                .map(|_| Vec::with_capacity(per_p_est))
+                .collect();
+            let mut i = 0;
+            let n = shard.len();
+            while i < n {
+                let kept = &shard[i];
+                let mut next_i = i + 1;
+                while next_i < n && shard[next_i].cid == kept.cid {
+                    next_i += 1;
                 }
-                let click_id = fields[0];
-                let uid = fields[1];
-                let camp_bytes = fields[2];
-                let ts_bytes = fields[3];
-
-                if uid.is_empty() {
-                    continue;
+                if kept.is_valid {
+                    let p_shard = (kept.person_hash as usize) % NUM_SHARDS;
+                    person_buckets[p_shard].push(ShardClick {
+                        person_hash: kept.person_hash,
+                        canon_name: kept.canon_name,
+                        ts: kept.ts,
+                        camp_id: kept.camp_id,
+                        click_id: kept.cid,
+                    });
                 }
-                let ts = match parse_timestamp(ts_bytes) {
-                    Some(t) if t >= click_window_start_ms && t < window_end_ms => t,
-                    _ => continue,
-                };
-                let camp_id = match camp_arc.get(camp_bytes) {
-                    Some(&c) => c,
-                    None => continue,
-                };
-
-                let canon_name = dsu_arc.get_canonical(uid);
-                let person_hash = ahash_builder.hash_one(canon_name);
-
-                let p_shard = (person_hash as usize) % NUM_SHARDS;
-                person_buckets[p_shard].push(ShardClick {
-                    person_hash,
-                    canon_name,
-                    ts,
-                    camp_id,
-                    click_id,
-                });
+                i = next_i;
             }
-
             person_buckets
         })
         .collect();
@@ -831,16 +936,29 @@ fn main() {
             shard
         })
         .collect();
+    drop(dedup_click_shards);
 
     let cat_names_arc = Arc::new(cat_names);
+    let u_out_folder = out_path.join("user_daily");
+    fs::create_dir_all(&u_out_folder).expect("Failed to create user_daily dir");
 
-    // 8. Parallel Sessionization & Attribution across all Person Shards
-    let shard_results: Vec<(Vec<UserDayRow>, Vec<Vec<CampDayAgg>>)> = (0..NUM_SHARDS)
+    let user_schema = Arc::new(Schema::new(vec![
+        Field::new("user_id", DataType::Utf8, false),
+        Field::new("day", DataType::Date32, false),
+        Field::new("sessions", DataType::Int64, false),
+        Field::new("events", DataType::Int64, false),
+        Field::new("revenue_cents", DataType::Int64, false),
+        Field::new("top_category", DataType::Utf8, true),
+    ]));
+
+    let any_user_files_written = Arc::new(AtomicBool::new(false));
+
+    // 8. Parallel Sessionization, Attribution & Direct Parallel Parquet Writing
+    let camp_shards: Vec<Vec<Vec<CampDayAgg>>> = person_event_shards
         .into_par_iter()
-        .map(|p| {
-            let mut events = person_event_shards[p].clone();
-            let mut clicks = person_click_shards[p].clone();
-
+        .zip(person_click_shards.into_par_iter())
+        .enumerate()
+        .map(|(p, (mut events, mut clicks))| {
             events.sort_unstable_by(|a, b| {
                 a.person_hash
                     .cmp(&b.person_hash)
@@ -1037,67 +1155,72 @@ fn main() {
                 e_idx = e_end;
             }
 
-            (local_user_rows, local_camp)
+            // Direct Parallel Parquet Writing for user_daily
+            if !local_user_rows.is_empty() {
+                any_user_files_written.store(true, Ordering::Relaxed);
+                let n_rows = local_user_rows.len();
+                let mut u_builder = StringBuilder::with_capacity(n_rows, n_rows * 16);
+                let mut u_days = Vec::with_capacity(n_rows);
+                let mut u_sessions = Vec::with_capacity(n_rows);
+                let mut u_events = Vec::with_capacity(n_rows);
+                let mut u_revenue = Vec::with_capacity(n_rows);
+                let mut u_top_cat_builder = StringBuilder::with_capacity(n_rows, n_rows * 12);
+
+                for row in &local_user_rows {
+                    u_builder.append_value(std::str::from_utf8(row.person_name).unwrap_or(""));
+                    u_days.push(row.day);
+                    u_sessions.push(row.sessions);
+                    u_events.push(row.events);
+                    u_revenue.push(row.revenue_cents);
+                    if let Some(cat_id) = row.top_cat_id {
+                        u_top_cat_builder.append_value(&cat_names_arc[cat_id as usize]);
+                    } else {
+                        u_top_cat_builder.append_null();
+                    }
+                }
+
+                let u_batch = RecordBatch::try_new(
+                    user_schema.clone(),
+                    vec![
+                        Arc::new(u_builder.finish()) as ArrayRef,
+                        Arc::new(Date32Array::from(u_days)) as ArrayRef,
+                        Arc::new(Int64Array::from(u_sessions)) as ArrayRef,
+                        Arc::new(Int64Array::from(u_events)) as ArrayRef,
+                        Arc::new(Int64Array::from(u_revenue)) as ArrayRef,
+                        Arc::new(u_top_cat_builder.finish()) as ArrayRef,
+                    ],
+                )
+                .expect("Failed to create user_daily batch");
+
+                let part_file_name = format!("part-{}.parquet", p);
+                let u_file = File::create(u_out_folder.join(part_file_name)).expect("Failed to create user parquet");
+                let props = WriterProperties::builder()
+                    .set_compression(Compression::SNAPPY)
+                    .build();
+                let mut u_writer = ArrowWriter::try_new(u_file, user_schema.clone(), Some(props))
+                    .expect("Failed to init user writer");
+                u_writer.write(&u_batch).expect("Failed to write user batch");
+                u_writer.close().expect("Failed to close user writer");
+            }
+
+            local_camp
         })
         .collect();
 
-    // 9. Write user_daily Parquet
-    let user_schema = Arc::new(Schema::new(vec![
-        Field::new("user_id", DataType::Utf8, false),
-        Field::new("day", DataType::Date32, false),
-        Field::new("sessions", DataType::Int64, false),
-        Field::new("events", DataType::Int64, false),
-        Field::new("revenue_cents", DataType::Int64, false),
-        Field::new("top_category", DataType::Utf8, true),
-    ]));
-
-    let total_user_rows: usize = shard_results.iter().map(|(r, _)| r.len()).sum();
-    let mut u_builder = StringBuilder::with_capacity(total_user_rows, total_user_rows * 16);
-    let mut u_days = Vec::with_capacity(total_user_rows);
-    let mut u_sessions = Vec::with_capacity(total_user_rows);
-    let mut u_events = Vec::with_capacity(total_user_rows);
-    let mut u_revenue = Vec::with_capacity(total_user_rows);
-    let mut u_top_cat_builder = StringBuilder::with_capacity(total_user_rows, total_user_rows * 12);
-
-    for (user_rows, _) in &shard_results {
-        for row in user_rows {
-            u_builder.append_value(std::str::from_utf8(row.person_name).unwrap_or(""));
-            u_days.push(row.day);
-            u_sessions.push(row.sessions);
-            u_events.push(row.events);
-            u_revenue.push(row.revenue_cents);
-            if let Some(cat_id) = row.top_cat_id {
-                u_top_cat_builder.append_value(&cat_names_arc[cat_id as usize]);
-            } else {
-                u_top_cat_builder.append_null();
-            }
-        }
+    // If no user daily rows exist anywhere, write empty part-0.parquet
+    if !any_user_files_written.load(Ordering::Relaxed) {
+        let u_batch = RecordBatch::new_empty(user_schema.clone());
+        let u_file = File::create(u_out_folder.join("part-0.parquet")).expect("Failed to create empty user parquet");
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .build();
+        let mut u_writer = ArrowWriter::try_new(u_file, user_schema, Some(props))
+            .expect("Failed to init empty user writer");
+        u_writer.write(&u_batch).expect("Failed to write empty user batch");
+        u_writer.close().expect("Failed to close empty user writer");
     }
 
-    let u_batch = RecordBatch::try_new(
-        user_schema.clone(),
-        vec![
-            Arc::new(u_builder.finish()) as ArrayRef,
-            Arc::new(Date32Array::from(u_days)) as ArrayRef,
-            Arc::new(Int64Array::from(u_sessions)) as ArrayRef,
-            Arc::new(Int64Array::from(u_events)) as ArrayRef,
-            Arc::new(Int64Array::from(u_revenue)) as ArrayRef,
-            Arc::new(u_top_cat_builder.finish()) as ArrayRef,
-        ],
-    )
-    .expect("Failed to create user_daily batch");
-
-    let u_out_folder = out_path.join("user_daily");
-    fs::create_dir_all(&u_out_folder).expect("Failed to create user_daily dir");
-    let u_file = File::create(u_out_folder.join("part-0.parquet")).expect("Failed to create user parquet");
-    let props = WriterProperties::builder()
-        .set_compression(Compression::SNAPPY)
-        .build();
-    let mut u_writer = ArrowWriter::try_new(u_file, user_schema, Some(props)).expect("Failed to init user writer");
-    u_writer.write(&u_batch).expect("Failed to write user batch");
-    u_writer.close().expect("Failed to close user writer");
-
-    // 10. Merge & Write campaign_daily Parquet
+    // 9. Merge & Write campaign_daily Parquet
     let camp_schema = Arc::new(Schema::new(vec![
         Field::new("campaign_id", DataType::Utf8, false),
         Field::new("channel", DataType::Utf8, false),
@@ -1109,7 +1232,7 @@ fn main() {
     ]));
 
     let mut global_camp: Vec<Vec<CampDayAgg>> = vec![vec![CampDayAgg::default(); MAX_DAYS]; num_campaigns];
-    for (_, shard_camp) in &shard_results {
+    for shard_camp in &camp_shards {
         for c in 0..num_campaigns {
             for d in 0..MAX_DAYS {
                 global_camp[c][d].add(&shard_camp[c][d]);

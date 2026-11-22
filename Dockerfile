@@ -3,6 +3,7 @@ FROM rust:1.85-bookworm AS builder
 WORKDIR /app
 COPY Cargo.toml Cargo.lock* ./
 COPY src/ ./src/
+ENV RUSTFLAGS="-C target-cpu=x86-64-v3"
 RUN cargo build --release
 
 # Stage 2: Minimal runtime image
